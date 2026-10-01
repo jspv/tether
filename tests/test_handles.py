@@ -157,6 +157,23 @@ def test_describe_dataframe_matches_put(tmp_path):
     assert described["bytes"] == handle.bytes
 
 
+def test_describe_dataframe_pins_pandas_dtype_vocabulary(tmp_path):
+    """Guard against the schema silently switching to arrow-native type names.
+
+    The put-vs-describe comparison cannot catch this: put() derives its metadata by
+    calling _describe_dataframe, so both sides of that equality are the same code.
+    These values are pandas' own dtype reprs -- arrow would render them "int64"/"double"/
+    "string"/"bool"/"timestamp[us]".
+    """
+    store = HandleStore(tmp_path / "r")
+    df = pd.DataFrame({"i": range(3), "f": [1.5] * 3, "s": ["a"] * 3, "b": [True] * 3})
+    handle = store.put(df, source="t")
+
+    described = store._describe_dataframe(store.root / handle.path)
+
+    assert described["schema"] == {"i": "int64", "f": "float64", "s": "str", "b": "bool"}
+
+
 def test_describe_dataframe_reads_only_first_row_group(tmp_path):
     """A 500MB handle must not be materialized to describe it: schema and row count come
     from the footer, the preview from row group 0 only."""
@@ -198,8 +215,8 @@ def test_describe_text_and_json_bound_the_preview(tmp_path):
     store = HandleStore(tmp_path / "r")
     text_path = store.root / "handles" / "x.txt"
     text_path.write_text("z" * 10_000, encoding="utf-8")
-    assert len(store._describe_text(text_path)["preview"]) == 800
+    assert len(store._describe_textual(text_path)["preview"]) == 800
 
     json_path = store.root / "handles" / "x.json"
     json_path.write_text('["' + "z" * 10_000 + '"]', encoding="utf-8")
-    assert len(store._describe_json(json_path)["preview"]) == 800
+    assert len(store._describe_textual(json_path)["preview"]) == 800

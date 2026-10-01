@@ -102,14 +102,14 @@ class HandleStore:
         path = self.root / rel
         path.write_text(json.dumps(obj, default=str), encoding="utf-8")
         return Handle(id=hid, kind="json", path=rel, source=source,
-                      **self._describe_json(path))
+                      **self._describe_textual(path))
 
     def _write_text(self, hid: str, obj: str, source: str) -> Handle:
         rel = f"handles/{hid}.txt"
         path = self.root / rel
         path.write_text(obj, encoding="utf-8")
         return Handle(id=hid, kind="text", path=rel, source=source,
-                      **self._describe_text(path))
+                      **self._describe_textual(path))
 
     def _describe_dataframe(self, path: Path) -> dict[str, Any]:
         """Describe a parquet file without materializing it.
@@ -139,11 +139,10 @@ class HandleStore:
             "n_cols": int(len(schema_df.columns)),
         }
 
-    def _describe_json(self, path: Path) -> dict[str, Any]:
-        text = path.read_text(encoding="utf-8")
-        return {"bytes": len(text.encode()), "preview": text[:_PREVIEW_CHARS]}
-
-    def _describe_text(self, path: Path) -> dict[str, Any]:
+    def _describe_textual(self, path: Path) -> dict[str, Any]:
+        """Describe a json or text handle. One body serves both kinds: their summaries are
+        identical, and two copies of this would drift the first time one format needed
+        different preview handling."""
         text = path.read_text(encoding="utf-8")
         return {"bytes": len(text.encode()), "preview": text[:_PREVIEW_CHARS]}
 
