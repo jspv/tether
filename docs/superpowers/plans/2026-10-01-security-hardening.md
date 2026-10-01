@@ -1833,11 +1833,22 @@ Add to `tests/test_config.py`:
 from tether.config import SandboxConfig, TetherConfig
 
 
-def test_container_is_the_default_backend():
-    """Real isolation by default. Asserted directly because the suite's autouse fixture
-    pins local, which would otherwise hide a regression here."""
+def test_container_is_the_default_backend(monkeypatch):
+    """Real isolation by default.
+
+    The suite's autouse fixture pins ``local`` via TETHER_SANDBOX_BACKEND, which would
+    otherwise hide a regression in the shipped default -- so this test deletes the
+    variable and asserts what a user actually gets.
+    """
+    monkeypatch.delenv("TETHER_SANDBOX_BACKEND", raising=False)
     assert SandboxConfig().backend == "container"
     assert TetherConfig().sandbox.backend == "container"
+
+
+def test_sandbox_backend_env_override(monkeypatch):
+    monkeypatch.setenv("TETHER_SANDBOX_BACKEND", "local")
+    assert SandboxConfig().backend == "local"
+    assert SandboxConfig(backend="container").backend == "container"   # explicit arg wins
 ```
 
 Add to `tests/test_container_runtime.py`:
@@ -1889,21 +1900,25 @@ Create `tests/conftest.py`:
 
 The shipped default sandbox backend is ``container`` (real isolation). The test suite must
 stay offline, fast, and runnable without podman or docker, so every test gets ``local``
-unless it asks otherwise. Tests that specifically exercise the container tier construct
-their own SandboxConfig and are gated on a runtime being present.
+unless it asks otherwise. Tests that specifically exercise the container tier build their
+own SandboxConfig and are gated on a runtime being present.
 
-Note the one deliberate exception: ``test_config.py`` asserts the *shipped* default
-directly, so this fixture must not be what defines it.
+This pins the backend through the environment variable the field's default_factory reads.
+Do NOT use ``monkeypatch.setattr(SandboxConfig, "backend", "local")`` -- that is a silent
+no-op. A dataclass bakes its defaults into ``__init__.__defaults__`` at class-creation
+time, so reassigning the class attribute afterwards does not change what
+``SandboxConfig()`` produces (verified).
+
+``test_config.py`` asserts the *shipped* default and must therefore delete the variable
+rather than rely on this fixture.
 """
 
 import pytest
 
-from tether.config import SandboxConfig
-
 
 @pytest.fixture(autouse=True)
 def _local_sandbox_by_default(monkeypatch):
-    monkeypatch.setattr(SandboxConfig, "backend", "local")
+    monkeypatch.setenv("TETHER_SANDBOX_BACKEND", "local")
 ```
 
 - [ ] **Step 4: Add the exception and the guard**
@@ -1958,11 +1973,31 @@ Import `SandboxRuntimeUnavailable` alongside the other `.sandbox` imports in `se
 
 - [ ] **Step 5: Flip the default**
 
-In `tether/config.py`:
+In `tether/config.py`, add the factory above `SandboxConfig` and use it for the field. A
+`default_factory` (rather than a bare literal) is what makes the default pinnable from the
+environment — which is how the test suite stays runtime-free and how a deployment can
+select a tier without editing code:
 
 ```python
-    backend: Literal["local", "container"] = "container"   # real isolation by default
+def _default_sandbox_backend() -> str:
+    """Shipped default: the container tier, i.e. real isolation.
+
+    ``TETHER_SANDBOX_BACKEND`` overrides it. Setting it to ``local`` opts out of isolation
+    entirely, so it is only for environments that have made that choice deliberately --
+    CI and the test suite, which must run without a container runtime. An explicit
+    ``SandboxConfig(backend=...)`` argument still wins over the variable.
+    """
+    return os.environ.get("TETHER_SANDBOX_BACKEND", "container")
 ```
+
+```python
+    backend: Literal["local", "container"] = field(default_factory=_default_sandbox_backend)
+```
+
+`import os` at the top of `config.py` (`field` is already imported). Verified: the shipped
+default is `container`, the variable pins `local`, an explicit argument overrides both, and
+`dataclasses.replace` preserves the resolved value — which `manager.py:88` relies on when
+it rewrites `root_dir` per conversation.
 
 - [ ] **Step 6: Export the exception**
 
@@ -2030,6 +2065,11 @@ Add to **Security and confinement** a short bullet, since it is a user-visible p
 Add rows for `allow_private_hosts`, `max_redirects`, `max_emit_bytes`, `max_control_bytes`,
 and `max_new_handles`, and change the `sandbox` row's note to say the backend now defaults to
 `container`.
+
+Document `TETHER_SANDBOX_BACKEND` alongside it: it overrides the default backend, and setting
+it to `local` opts out of isolation — intended for CI and test environments that have made
+that choice deliberately. State plainly that an explicit `SandboxConfig(backend=...)` wins
+over the variable.
 
 Also flag `max_file_size_mb` as **local-tier only**. It is already documented as unenforced
 on the container tier, but that tier is now the default — a config field that silently does
