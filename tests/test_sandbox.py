@@ -489,3 +489,86 @@ def test_container_sandbox_stores_limits(tmp_path):
     limits = ControlPlaneLimits(max_emit_bytes=5, max_control_bytes=6, max_new_handles=7)
     sb = ContainerSandbox(root=tmp_path, store=None, runtime="podman", limits=limits)
     assert sb.limits is limits
+
+
+# --- the control channel must never raise out of run_python -------------------------------
+# run_python is documented to return {stdout, stderr, result, error, exit_code, new_handles,
+# killed_by}. Anything a hostile or merely broken child can do to a control file has to come
+# back as that dict with an `error`, not as an exception unwinding through the tool layer.
+
+def _assert_is_exec_result(res):
+    for field in ("stdout", "stderr", "result", "error", "exit_code", "new_handles",
+                  "killed_by"):
+        assert hasattr(res, field), f"missing {field}"
+
+
+def test_non_utf8_emit_payload_is_reported_not_raised(tmp_path):
+    sb, _ = _sandbox(tmp_path)
+    res = sb.run_code(
+        "import os\n"
+        "open(os.environ['TETHER_EMIT'], 'wb').write(b'\\xff\\xfe\\x00bad')\n"
+    )
+    _assert_is_exec_result(res)
+    assert res.result is None
+    assert "malformed emit payload" in (res.error or "")
+
+
+def test_non_utf8_new_handles_record_is_reported_not_raised(tmp_path):
+    sb, _ = _sandbox(tmp_path)
+    res = sb.run_code(
+        "import os\n"
+        "open(os.environ['TETHER_NEW_HANDLES'], 'wb').write(b'\\xff\\xfe\\x00bad\\n')\n"
+    )
+    _assert_is_exec_result(res)
+    assert res.new_handles == []
+
+
+def test_non_utf8_bytes_do_not_hide_a_valid_new_handle_record(tmp_path):
+    """errors='replace' must degrade the bad line only -- a good record still lands."""
+    sb, _ = _sandbox(tmp_path)
+    res = sb.run_code(
+        "import json, os\n"
+        "open(os.path.join('handles', 'ok.txt'), 'w').write('fine')\n"
+        "f = open(os.environ['TETHER_NEW_HANDLES'], 'ab')\n"
+        "f.write(b'\\xff\\xfe garbage\\n')\n"
+        "f.write((json.dumps({'id': 'h9', 'kind': 'text', 'path': 'handles/ok.txt',\n"
+        "                     'source': 'run_python'}) + '\\n').encode())\n"
+        "f.close()\n"
+    )
+    _assert_is_exec_result(res)
+    assert res.new_handles == ["h9"]
+
+
+def test_directory_at_the_emit_path_is_reported_not_raised(tmp_path):
+    """A child that pre-creates a directory at a control path makes read_text raise
+    IsADirectoryError, and would then make the finally-block unlink raise while unwinding."""
+    sb, _ = _sandbox(tmp_path)
+    res = sb.run_code(
+        "import os\n"
+        "os.mkdir(os.environ['TETHER_EMIT'])\n"
+    )
+    _assert_is_exec_result(res)
+    assert res.result is None
+
+
+def test_directory_at_the_new_handles_path_is_reported_not_raised(tmp_path):
+    sb, _ = _sandbox(tmp_path)
+    res = sb.run_code(
+        "import os\n"
+        "p = os.environ['TETHER_NEW_HANDLES']\n"
+        "os.remove(p)\n"
+        "os.mkdir(p)\n"
+    )
+    _assert_is_exec_result(res)
+    assert res.new_handles == []
+
+
+def test_control_plane_limit_defaults_match_tether_config(tmp_path):
+    """ControlPlaneLimits duplicates TetherConfig's caps with only a docstring holding them
+    together. Nothing but this test notices if one side is changed alone."""
+    from tether.config import TetherConfig
+
+    cfg = TetherConfig()
+    lim = ControlPlaneLimits()
+    assert (lim.max_emit_bytes, lim.max_control_bytes, lim.max_new_handles) == (
+        cfg.max_emit_bytes, cfg.max_control_bytes, cfg.max_new_handles)

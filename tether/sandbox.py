@@ -137,17 +137,24 @@ class _OrchestratedSandbox:
             result = None
             emit_error = None
             if launched.exit_code == 0 and emit_file.exists():
-                size = emit_file.stat().st_size
-                if size > self.limits.max_emit_bytes:
-                    # Check the size BEFORE parsing: a hostile child must not be able to
-                    # flood context (or the parser) through the result channel.
-                    emit_error = (f"tether: emit payload too large ({size} bytes > "
-                                  f"{self.limits.max_emit_bytes}); save a handle instead")
-                else:
-                    try:
-                        result = json.loads(emit_file.read_text(encoding="utf-8"))
-                    except json.JSONDecodeError as e:
-                        emit_error = f"tether: malformed emit payload: {e}"
+                # Everything about this file is child-controlled: its bytes, its encoding,
+                # even whether it is a file at all (a child can leave a directory at the
+                # path). run_python has a documented return shape, so every one of those
+                # has to become an `error` string, not an exception unwinding through the
+                # tool layer. ``errors="replace"`` keeps a non-UTF-8 payload from raising
+                # before json.loads can reject it -- the size cap above already bounds it.
+                try:
+                    size = emit_file.stat().st_size
+                    if size > self.limits.max_emit_bytes:
+                        # Check the size BEFORE parsing: a hostile child must not be able to
+                        # flood context (or the parser) through the result channel.
+                        emit_error = (f"tether: emit payload too large ({size} bytes > "
+                                      f"{self.limits.max_emit_bytes}); save a handle instead")
+                    else:
+                        result = json.loads(
+                            emit_file.read_text(encoding="utf-8", errors="replace"))
+                except (json.JSONDecodeError, OSError) as e:
+                    emit_error = f"tether: malformed emit payload: {e}"
 
             # Ergonomic fallback: if the script neither emitted nor ended in an expression but
             # printed something, surface that so a model that just print()s an answer still gets one.
@@ -164,7 +171,14 @@ class _OrchestratedSandbox:
                               new_handles=new_handles, killed_by=launched.killed_by)
         finally:
             for f in (new_handles_file, emit_file, registry_file):
-                f.unlink(missing_ok=True)
+                try:
+                    f.unlink(missing_ok=True)
+                except OSError:
+                    # A child can leave a directory (or something else unlinkable) at a
+                    # control path. Cleanup must never raise while unwinding: that would
+                    # replace the run's real result -- or a real exception -- with a
+                    # cleanup failure. The stale entry is per-run-unique, so it is inert.
+                    pass
 
     def _ingest_new_handles(self, new_handles_file: Path) -> tuple[list[str], str | None]:
         """Adopt handles the child wrote; return (ids, error).
@@ -179,14 +193,21 @@ class _OrchestratedSandbox:
         ids: list[str] = []
         if not new_handles_file.exists():
             return ids, None
-        size = new_handles_file.stat().st_size
-        if size > self.limits.max_control_bytes:
-            return ids, (f"tether: control file too large ({size} bytes > "
-                         f"{self.limits.max_control_bytes}); no handles ingested")
+        # As with the emit file, the child controls these bytes and may even replace the
+        # file with a directory, so stat + read are guarded and the decode replaces bad
+        # bytes rather than raising: a corrupt line must degrade that line, not the run.
+        try:
+            size = new_handles_file.stat().st_size
+            if size > self.limits.max_control_bytes:
+                return ids, (f"tether: control file too large ({size} bytes > "
+                             f"{self.limits.max_control_bytes}); no handles ingested")
+            lines = new_handles_file.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError as e:
+            return ids, f"tether: could not read the new-handles control file: {e}"
         reused: dict[str, None] = {}   # distinct rejected ids, insertion-ordered
         reused_count = 0
         cap_error: str | None = None
-        for line in new_handles_file.read_text(encoding="utf-8").splitlines():
+        for line in lines:
             line = line.strip()
             if not line:
                 continue
