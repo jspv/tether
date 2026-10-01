@@ -98,12 +98,14 @@ def test_fetch_follows_redirects(tmp_path):
     assert sess.store.get(summary["id"]) == "final page"
 
 
-def test_default_client_has_user_agent_and_follows_redirects(tmp_path):
+def test_default_client_has_user_agent_and_does_not_follow_redirects(tmp_path):
+    """_default_client sets follow_redirects=False so guarded_get can handle redirects
+    with re-validation against egress policy for each hop."""
     from tether.tools.fetch import _default_client
 
     c = _default_client(TetherConfig().fetch)
     try:
-        assert c.follow_redirects is False  # guarded_get handles redirects with re-validation
+        assert c.follow_redirects is False
         assert "Mozilla" in c.headers["user-agent"]
     finally:
         c.close()
@@ -221,3 +223,22 @@ def test_fetch_url_allows_an_allowlisted_internal_host(tmp_path):
         out = fetch_url(session, "http://127.0.0.1/report", client=client)
     assert "error" not in out
     assert out["kind"] == "text"
+
+
+def test_fetch_url_blocks_a_redirect_into_an_internal_address(tmp_path):
+    """The guard must apply to hops, not just the initial URL -- and fetch_url must report
+    it with the same structured-error contract as any other failure."""
+    session = _session(tmp_path)
+
+    def handler(request):
+        if "127.0.0.1" in str(request.url):
+            return httpx.Response(200, text="internal data")
+        return httpx.Response(302, headers={"Location": "http://127.0.0.1:8080/admin"})
+
+    client = httpx.Client(transport=httpx.MockTransport(handler), follow_redirects=False)
+    with client:
+        out = fetch_url(session, "http://93.184.216.34/start", client=client)
+
+    assert out["status"] is None
+    assert "blocked by egress policy" in out["error"]
+    assert "127.0.0.1" in out["error"]
