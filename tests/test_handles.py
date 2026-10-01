@@ -220,3 +220,98 @@ def test_describe_text_and_json_bound_the_preview(tmp_path):
     json_path = store.root / "handles" / "x.json"
     json_path.write_text('["' + "z" * 10_000 + '"]', encoding="utf-8")
     assert len(store._describe_textual(json_path)["preview"]) == 800
+
+
+def _write_parquet(store, rel="handles/h9.parquet", rows=3):
+    import pandas as pd
+    pd.DataFrame({"a": range(rows)}).to_parquet(store.root / rel)
+    return rel
+
+
+def test_adopt_ignores_forged_metadata(tmp_path):
+    """THE central test: a child may claim anything; the store reports the truth."""
+    store = HandleStore(tmp_path / "r")
+    rel = _write_parquet(store, rows=3)
+
+    handle = store.adopt(id="h9", kind="dataframe", path=rel, source="run_python")
+
+    assert handle.n_rows == 3                      # not whatever a child claimed
+    assert handle.n_cols == 1
+    assert handle.schema == {"a": "int64"}
+    assert handle.preview.startswith("a\n0\n1\n2\n")
+    assert handle.bytes == (store.root / rel).stat().st_size
+
+
+def test_adopt_rejects_existing_id(tmp_path):
+    """Handles are immutable: sandboxed code cannot repoint h1 at different bytes."""
+    store = HandleStore(tmp_path / "r")
+    original = store.put({"real": True}, source="trusted")
+    rel = _write_parquet(store, rel="handles/evil.parquet")
+
+    with pytest.raises(ValueError, match="already exists"):
+        store.adopt(id=original.id, kind="dataframe", path=rel, source="run_python")
+
+    assert store.summary(original.id) == original.summary()   # untouched
+
+
+def test_adopt_rejects_path_escaping_root(tmp_path):
+    store = HandleStore(tmp_path / "r")
+    (tmp_path / "outside.txt").write_text("secret", encoding="utf-8")
+    with pytest.raises(ValueError, match="escapes root"):
+        store.adopt(id="h9", kind="text", path="../outside.txt", source="run_python")
+
+
+def test_adopt_rejects_missing_file(tmp_path):
+    store = HandleStore(tmp_path / "r")
+    with pytest.raises(ValueError, match="not a regular file"):
+        store.adopt(id="h9", kind="text", path="handles/nope.txt", source="run_python")
+
+
+def test_adopt_rejects_directory(tmp_path):
+    store = HandleStore(tmp_path / "r")
+    (store.root / "handles" / "adir").mkdir()
+    with pytest.raises(ValueError, match="not a regular file"):
+        store.adopt(id="h9", kind="text", path="handles/adir", source="run_python")
+
+
+def test_adopt_rejects_symlink(tmp_path):
+    """A symlink resolving inside the root still passes safe_path, so it is rejected
+    by the regular-file check instead."""
+    store = HandleStore(tmp_path / "r")
+    target = store.root / "handles" / "real.txt"
+    target.write_text("x", encoding="utf-8")
+    link = store.root / "handles" / "link.txt"
+    link.symlink_to(target)
+    with pytest.raises(ValueError, match="not a regular file"):
+        store.adopt(id="h9", kind="text", path="handles/link.txt", source="run_python")
+
+
+def test_adopt_rejects_unknown_kind(tmp_path):
+    store = HandleStore(tmp_path / "r")
+    p = store.root / "handles" / "x.txt"
+    p.write_text("x", encoding="utf-8")
+    with pytest.raises(ValueError, match="unknown handle kind"):
+        store.adopt(id="h9", kind="pickle", path="handles/x.txt", source="run_python")
+
+
+def test_adopt_bounds_preview_of_huge_file(tmp_path):
+    store = HandleStore(tmp_path / "r")
+    p = store.root / "handles" / "big.txt"
+    p.write_text("z" * 5_000_000, encoding="utf-8")
+    handle = store.adopt(id="h9", kind="text", path="handles/big.txt", source="run_python")
+    assert len(handle.preview) == 800          # context cannot be flooded
+    assert handle.bytes == 5_000_000
+
+
+def test_adopt_and_put_produce_identical_summaries(tmp_path):
+    import pandas as pd
+    store = HandleStore(tmp_path / "r")
+    df = pd.DataFrame({"a": range(7), "b": ["x"] * 7})
+    put_handle = store.put(df, source="same")
+
+    other = HandleStore(tmp_path / "r2")
+    rel = "handles/h1.parquet"
+    df.to_parquet(other.root / rel)
+    adopted = other.adopt(id="h1", kind="dataframe", path=rel, source="same")
+
+    assert adopted.summary() == put_handle.summary()

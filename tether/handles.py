@@ -33,6 +33,10 @@ class Handle:
 class HandleStore:
     """Persists objects under ``<root>/handles`` and tracks them by id."""
 
+    # json and text describe identically, so both kinds dispatch to the one shared body.
+    _DESCRIBERS = {"dataframe": "_describe_dataframe", "json": "_describe_textual",
+                   "text": "_describe_textual", "binary": "_describe_binary"}
+
     def __init__(self, root: Path | str) -> None:
         self.root = Path(root).resolve()
         self.dir = self.root / "handles"
@@ -177,6 +181,32 @@ class HandleStore:
     def register(self, record: dict[str, Any]) -> Handle:
         """Register a handle whose file already exists; persists the manifest."""
         handle = self._register_record(record)
+        self._save_manifest()
+        return handle
+
+    def adopt(self, *, id: str, kind: str, path: str, source: str) -> Handle:
+        """Register a file written by sandboxed code, deriving its metadata here.
+
+        The child reports only what it alone knows -- which file it wrote, and why. Every
+        field that reaches model context (preview, bytes, schema, n_rows, n_cols) is
+        computed from the bytes on disk, so a hostile child cannot describe its output
+        falsely. Handles are immutable: adopting an id that already exists is refused, so
+        the record for a handle the child did not create cannot be repointed.
+        """
+        if id in self._handles:
+            raise ValueError(f"handle id {id!r} already exists; handles are immutable")
+        describer = self._DESCRIBERS.get(kind)
+        if describer is None:
+            raise ValueError(f"unknown handle kind: {kind!r}")
+        resolved = safe_path(self.root, path)  # raises PathEscapesRootError -> ValueError subclass
+        # A directory, symlink, FIFO or device would hang or mislead the describer. safe_path
+        # already resolved symlinks, so compare against the unresolved path to catch them.
+        if not resolved.is_file() or (self.root / path).is_symlink():
+            raise ValueError(f"handle record path is not a regular file: {path!r}")
+        described = getattr(self, describer)(resolved)
+        handle = Handle(id=id, kind=kind, path=path, source=source, **described)
+        self._handles[id] = handle
+        self._advance_counter(id)
         self._save_manifest()
         return handle
 
