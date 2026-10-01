@@ -2066,10 +2066,15 @@ def _build_sandbox(root: Path, store: HandleStore, sandbox_config: SandboxConfig
     contained. The opt-out has to be explicit.
     """
     if sandbox_config.backend == "container":
+        from . import container_runtime
         from .sandbox_container import ContainerSandbox  # local import: optional backend
         try:
-            # ContainerSandbox.__init__ calls detect_runtime itself and raises RuntimeError
-            # when no runtime exists, so wrap construction rather than detecting twice.
+            # Probe LIVENESS, not mere presence. `detect_runtime` only checks shutil.which,
+            # so a machine with podman installed but its VM not started passes detection and
+            # then fails much later with an opaque "failed to build sandbox image" error.
+            # That is the most common failure mode -- especially on macOS, where the runtime
+            # lives in a Linux VM -- and it is exactly the case this message exists to serve.
+            container_runtime.require_usable_runtime(sandbox_config.container_runtime)
             return ContainerSandbox(root=root, store=store, config=sandbox_config,
                                     limits=limits)
         except RuntimeError as e:
@@ -2082,6 +2087,45 @@ def _build_sandbox(root: Path, store: HandleStore, sandbox_config: SandboxConfig
 ```
 
 Import `SandboxRuntimeUnavailable` alongside the other `.sandbox` imports in `session.py`.
+
+- [ ] **Step 4b: Add the liveness probe**
+
+`detect_runtime` answers "is there a binary?", which is not the question. Add to
+`tether/container_runtime.py`:
+
+```python
+def require_usable_runtime(override: str | None, run: Callable = subprocess.run) -> str:
+    """Return a runtime that is actually usable, else raise RuntimeError.
+
+    ``detect_runtime`` only checks PATH. A machine with podman installed but its VM not
+    started passes that check and then fails at first use with an opaque image-build error.
+    Probing once per session is cheap next to building or running a container.
+    """
+    runtime = detect_runtime(override)
+    try:
+        proc = run([runtime, "info"], capture_output=True, timeout=30)
+    except (OSError, subprocess.SubprocessError) as e:
+        raise RuntimeError(f"container runtime {runtime!r} is installed but not usable: {e}") from e
+    if proc.returncode != 0:
+        detail = (proc.stderr or b"").decode(errors="replace").strip().splitlines()
+        hint = detail[0] if detail else f"exit {proc.returncode}"
+        raise RuntimeError(
+            f"container runtime {runtime!r} is installed but not responding ({hint}). "
+            f"On macOS this usually means the VM is not started -- try `{runtime} machine start`."
+        )
+    return runtime
+```
+
+Test it with an injected `run` so no container is needed: a zero exit returns the runtime; a
+non-zero exit raises with the stderr hint; an `OSError` raises. Also assert that
+`_build_sandbox` surfaces it as `SandboxRuntimeUnavailable` naming the `local` opt-out.
+
+- [ ] **Step 4c: Fix the container-test gate**
+
+`tests/test_container_live.py` gates on `_RUNTIME is None`, which is presence, not liveness —
+so with podman installed and its machine down those 6 tests **run and fail** instead of
+skipping. Change the gate to use `require_usable_runtime`, catching `RuntimeError` and
+skipping. Verify the file skips cleanly when the runtime is down rather than erroring.
 
 - [ ] **Step 5: Flip the default**
 
