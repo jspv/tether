@@ -231,6 +231,27 @@ leaking host file contents through publish, or writing host files via `publish_h
 Not done, deliberately: moving `inputs/` out of the child-writable tree and dir-fd-relative
 walks. With runs serialized and timeouts enforced, no child runs during those operations.
 
+## Known gaps (deferred from final review, 2026-10-01)
+
+Eight findings the final review graded Minor were deferred at merge. They are recorded here so
+they live in the repo, each with its planned fix. Status: **open**; fixes in progress on
+`fix/known-gaps` (plan: `docs/superpowers/plans/2026-10-01-host-integration-known-gaps.md`).
+
+| # | Gap | Where | Planned fix |
+|---|---|---|---|
+| G1 | **Host-path oracle.** `validate_publication` runs `lstat` on the unresolved candidate before containment, so its distinct errors ("no such file" / "symlink" / "outside the workspace") tell sandboxed code whether an absolute host path exists. Via a planted parent-dir symlink it also distinguishes existing from missing host files. | `publish.py` | Check containment first (`safe_path`, which resolves but does not require existence), and return one message for every escape; only then `lstat` the in-root unresolved path for the final-component symlink check. |
+| G2 | **Stale or forged input handle.** A repeat `add_input` returns the manifest's handle without checking its file. After a delete, the handle points at nothing; in the container tier the manifest is child-writable, so the record itself can be forged. | `session.py` `_add_input` | Return the existing handle only if it is intact: `kind == "binary"`, path exactly `inputs/<input_id>/<file>`, and that path is a regular, non-symlink file inside the root. Otherwise re-copy and re-register **under the same handle id**, so host references stay valid. |
+| G3 | **Uploads can be blocked.** Sandboxed code can leave `inputs`, `inputs/<id>`, or the target filename as a symlink, file, or directory; `add_input` then fails for that conversation forever. | `session.py` `_input_dir` | Under the session lock, replace anything at those paths that is not the expected kind: unlink a symlink or file (never follow), `rmtree` a directory squatting on the target filename (`rmtree` does not follow links), then create. |
+| G4 | **Sandbox `publish()` without the bundle.** It is live whenever `on_publish` is set, even if `deliver` is not selected; the README implies both are required. | `session.py`, `conversation.py` | **Decision for review — recommended: gate it.** `Session.create(config, *, on_publish=None, bundles=None)` enables sandbox `publish()` only when `deliver` is among the selected bundles (`None` = all, as today, so direct `Session` users and existing tests keep working); `Conversation.acreate` passes its bundles. Alternative: keep the behavior and correct the README. |
+| G5 | **Model-facing docstring.** `run_python`'s description in `tools/registry.py` omits `publish()`. | `tools/registry.py` | Mention `publish(path)` as available when file delivery is enabled. |
+| G6 | **`aadd_input` blocks the event loop** while copying up to `max_input_bytes`. | `conversation.py` | Hold the turn lock, run the copy via `asyncio.to_thread`. |
+| G7 | **Unbounded copy of a host path.** The source is `stat`ed for size, then copied without a limit; a file that grows in between bypasses `max_input_bytes`. Low risk: the source is host-supplied. | `session.py` | Copy in a counted loop and abort (removing the temp file) once `max_input_bytes` is exceeded. |
+| G8 | **Build timeout leaks and doubling.** Killing `podman build` / the pip-layer CLI on timeout may leave the work running; `ensure_layer` gives the image build and the pip install each a full `build_timeout_s`. | `container_runtime.py` | One deadline per `ensure_layer` call shared across both steps; name the pip-layer container and `rm -f` it on timeout (as the sandbox does). An image build can't be cancelled by name; document that the runtime may finish it in the background. |
+
+Also outstanding, but owned by the hardening branch (see the plan's handoff note): the other
+control files (`_new_handles`, `_emit`, `_registry`) and the `.scripts/` directory still need
+the no-follow / non-blocking treatment the publish control file got.
+
 ## Config summary (all additive; existing call sites unchanged)
 
 | Field | Default | Item |
