@@ -25,6 +25,34 @@ class Result:
     error: str | None = None
 
 
+@dataclass(frozen=True)
+class ToolFactory:
+    """A deferred tool: ``build()`` is called once per conversation.
+
+    Marked explicitly rather than detected, because a plain python tool is itself a
+    callable -- sniffing would silently misclassify a user's zero-argument tool as a
+    factory and call it at setup time.
+    """
+    build: Callable[[], Any]
+
+
+def tool_factory(build: Callable[[], Any]) -> ToolFactory:
+    """Wrap a zero-argument callable so each conversation gets its own tool instance.
+
+    Use this for anything stateful or connected -- an MCP server above all. A single live
+    MCPTool shared across conversations is owned and closed by whichever session finishes
+    first, which is both a lifecycle bug and a cross-conversation leak.
+    """
+    if not callable(build):
+        raise TypeError(f"tool_factory expects a zero-argument callable, got {type(build)!r}")
+    return ToolFactory(build)
+
+
+def expand_tools(tools: list | None) -> list:
+    """Resolve ToolFactory entries into fresh instances; pass everything else through."""
+    return [t.build() if isinstance(t, ToolFactory) else t for t in (tools or [])]
+
+
 class Tether:
     """Reusable tether: builds a Session per run via the composable create_agent path."""
 
@@ -92,7 +120,8 @@ class Tether:
         sink = on_status if on_status is not None else self._on_status
         conv = await Conversation.acreate(
             id="oneshot", config=self.config, client=self._make_client(),
-            tools=self._tools + (tools or []), bundles=self._bundles, reap_on_close=not keep)
+            tools=expand_tools(self._tools) + expand_tools(tools),
+            bundles=self._bundles, reap_on_close=not keep)
         if sink is not None:
             conv.session.subscribe(sink)
         try:

@@ -1,6 +1,6 @@
 """Data-integration agent harness."""
 
-from .api import Tether, Result, solve
+from .api import Tether, Result, ToolFactory, solve, tool_factory
 from .config import FetchConfig, TetherConfig, SandboxConfig
 from .handles import Handle, HandleStore
 from .paths import PathEscapesRootError, safe_path
@@ -15,7 +15,7 @@ from .tools.registry import build_tools
 __version__ = "0.1.1"
 
 __all__ = [
-    "Tether", "Result", "solve",
+    "Tether", "Result", "solve", "ToolFactory", "tool_factory",
     "FetchConfig", "TetherConfig", "SandboxConfig",
     "Handle", "HandleStore",
     "PathEscapesRootError", "safe_path",

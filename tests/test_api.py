@@ -1,6 +1,9 @@
 import asyncio
 
+import pytest
+
 from tether import TetherConfig, Tether, report_progress
+from tether.api import ToolFactory, expand_tools, tool_factory
 from tether.testing import StubChatClient, text, tool_call
 
 
@@ -116,3 +119,69 @@ def test_solve_preserves_error_on_agent_failure(tmp_path):
     assert "RuntimeError" in result.error
     assert result.final_text == ""
     assert result.session_dir.exists()      # work-so-far / audit trail preserved
+
+
+def test_tool_factory_wraps_a_callable():
+    sentinel = object()
+    factory = tool_factory(lambda: sentinel)
+    assert isinstance(factory, ToolFactory)
+    assert factory.build() is sentinel
+
+
+def test_expand_tools_calls_each_factory_once():
+    calls = []
+
+    def build():
+        calls.append(1)
+        return f"tool-{len(calls)}"
+
+    tools = [tool_factory(build)]
+    first, second = expand_tools(tools), expand_tools(tools)
+
+    assert first == ["tool-1"]
+    assert second == ["tool-2"]        # a fresh instance per expansion
+    assert len(calls) == 2
+
+
+def test_expand_tools_passes_plain_tools_through_untouched():
+    def my_tool(x: int) -> int:
+        """A plain python tool is itself callable; it must not be mistaken for a factory."""
+        return x
+
+    out = expand_tools([my_tool])
+    assert out == [my_tool]            # not called, not unwrapped
+
+
+def test_expand_tools_handles_a_mixed_list():
+    def my_tool() -> str:
+        """Doc."""
+        return "direct"
+
+    out = expand_tools([my_tool, tool_factory(lambda: "built")])
+    assert out == [my_tool, "built"]
+
+
+def test_tool_factory_rejects_a_non_callable():
+    with pytest.raises(TypeError):
+        tool_factory("not callable")
+
+
+def test_asolve_expands_factories_per_call(tmp_path):
+    from tether.testing import StubChatClient, text
+
+    built = []
+
+    def build():
+        built.append(1)
+        return lambda: "ok"          # a plain tool the agent could call
+
+    build_tool = tool_factory(build)
+
+    async def run():
+        h = Tether(TetherConfig(root_dir=tmp_path / "r"),
+                   client=StubChatClient([text("x")]), tools=[build_tool])
+        await h.asolve("go")
+        await h.asolve("go")
+
+    asyncio.run(run())
+    assert len(built) == 2           # one instance per one-shot conversation

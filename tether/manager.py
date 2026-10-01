@@ -87,9 +87,11 @@ class SessionManager:
             conv_id = session_id or uuid.uuid4().hex
             config = dataclasses.replace(
                 self._tether.config, root_dir=str(_conv_root(self._tether.config, conv_id)))
+            from .api import expand_tools
+
             conv = await Conversation.acreate(
                 id=conv_id, config=config, client=self._tether._make_client(),
-                tools=self._tether._tools + (tools or []),
+                tools=expand_tools(self._tether._tools) + expand_tools(tools),
                 bundles=bundles if bundles is not None else self._tether._bundles,
                 reap_on_close=True,
             )

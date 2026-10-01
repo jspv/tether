@@ -2,7 +2,7 @@ import asyncio
 
 import pytest
 
-from tether import TetherConfig, Tether
+from tether import TetherConfig, Tether, tool_factory
 from tether.manager import SessionManager
 from tether.testing import StubChatClient, text
 
@@ -71,5 +71,46 @@ def test_sweep_reaps_idle(tmp_path):
         c.last_activity -= 1000
         await m.sweep()
         assert m.get("t1") is None
+
+    asyncio.run(run())
+
+
+class _FakeMCP:
+    """Stands in for a connected MCP server: identity matters, and so does close()."""
+    def __init__(self) -> None:
+        self.closed = False
+        self.functions: list = []         # lets Session recognise this as an MCP server
+
+    async def connect(self) -> None:
+        pass
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+def test_each_conversation_gets_its_own_tool_instance(tmp_path):
+    built = []
+
+    def build():
+        instance = _FakeMCP()
+        built.append(instance)
+        return instance
+
+    async def run():
+        tether = Tether(TetherConfig(root_dir=tmp_path / "base"),
+                        client=StubChatClient([text("x")]),
+                        tools=[tool_factory(build)])
+        try:
+            a = await tether.aopen("conv-a")
+            b = await tether.aopen("conv-b")
+            assert a is not b
+            assert len(built) == 2
+            assert built[0] is not built[1]   # no shared connection across conversations
+
+            await tether._sessions().close("conv-a")
+            assert built[0].closed is True
+            assert built[1].closed is False   # closing one must not close the other's
+        finally:
+            await tether.aclose_sessions()
 
     asyncio.run(run())
