@@ -115,11 +115,19 @@ then derives `preview`, `bytes`, `schema`, `n_rows`, `n_cols` by reading the fil
 the describers are the same code `put()` uses, an adopted handle and a parent-created handle
 are indistinguishable in shape, and the preview bound applies to both by construction.
 
-`_register_record` stays, unchanged, for manifest rehydration (`_load_manifest`) — those
-records are parent-authored, and rehydration must accept ids that already exist on disk. The
-public `register()` also stays, since rehydrating a prior session's manifest is a legitimate
+`_register_record` stays for manifest rehydration (`_load_manifest`), and the public
+`register()` stays with it, since rehydrating a prior session's manifest is a legitimate
 parent-side use; what changes is that **nothing on the sandbox ingestion path calls it any
 more**. The immutability rule lives on `adopt()`, the child path, only.
+
+> **Corrected during implementation.** This section originally said `_register_record` could
+> stay *unchanged* because its records "are parent-authored". That is false. The manifest
+> lives at `<root>/handles/_manifest.json` — inside the session root the container tier
+> bind-mounts **rw** into the sandbox — so sandboxed code can rewrite it and the next
+> `HandleStore(root)` would read it back. The rehydration path therefore re-derives: only
+> `id`, `kind`, `path` and `source` are taken from the record, every described field comes
+> from `_describe`, and a record whose file is missing or is not a regular file is dropped.
+> See "Amended during implementation" at the end of this document.
 
 **Orchestration side** (`sandbox.py`). `_ingest_new_handles` calls `adopt()` instead of
 `register()`, and gains two bounds a hostile child would otherwise ignore:
@@ -417,3 +425,27 @@ differs in two ways:
 - **They are non-allowlistable.** The check runs ahead of `allow_private_hosts` and nothing in
   `FetchConfig` can open them. Allowlisting a hostname vouches for the name, not for whatever
   it resolves to later.
+
+### The manifest and the bytes are inside the child-writable root
+
+The threat model above names the *control files* (registry, emit, new-handles) as living in
+the child-visible, bind-mounted session root. Two more things live there and were not named:
+
+- **The handle manifest** (`handles/_manifest.json`). The design above assumed its records
+  were parent-authored; they are not. A child can rewrite the manifest, and the next
+  `HandleStore` on that root would rehydrate the forged `preview`/`bytes`/`schema`/`n_rows`
+  verbatim. Reachable whenever a root outlives the process that created it: a pinned
+  `root_dir`, `asolve(keep=True)`, the eval harness, an AG-UI thread root. **Closed by
+  re-derivation** in `_register_record` — `id`, `kind`, `path`, `source` from the record,
+  everything else from `_describe`, and a record whose file is missing or is not a regular
+  file is dropped. Rehydration stays tolerant: a bad record is skipped, not fatal.
+- **The handle files themselves, after creation.** Metadata is derived once. Nothing stopped
+  a later `run_python` from overwriting the bytes under an existing handle without touching
+  the control channel, leaving the model holding a summary of data no longer on disk.
+  **Closed by a digest** recorded alongside the derived metadata and verified on the parent
+  side of every `HandleStore.get`; a mismatch raises `HandleTamperedError`. The digest is
+  sha256 over the file's length plus its first 64 KiB, not the whole file — the describers
+  deliberately read only a bounded window, and a whole-file hash would make every `get()`
+  re-read a multi-gigabyte parquet. Any length change, and any edit inside the window every
+  preview is drawn from, is caught; a length-preserving edit to the tail of a file larger
+  than 64 KiB is not. That bound is documented on `_digest_file` rather than implied.

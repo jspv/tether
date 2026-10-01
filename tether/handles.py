@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -11,6 +12,46 @@ from .paths import PathEscapesRootError, safe_path
 
 _PREVIEW_CHARS = 800
 _PREVIEW_ROWS = 5
+_DIGEST_BYTES = 64 * 1024
+
+
+def _digest_file(path: Path) -> str:
+    """Integrity digest for a handle's bytes: sha256 over the file's length plus its first
+    ``_DIGEST_BYTES`` bytes.
+
+    **Deliberately not a whole-file hash.** The describers read only a bounded window (a
+    preview, or one parquet row group) precisely so a multi-gigabyte handle can be described
+    cheaply; hashing the whole file would throw that away and make every ``get()`` re-read
+    the entire file just to validate it. A length-plus-prefix digest keeps the cost bounded
+    and is still a strong tamper signal: any rewrite that changes the file's length, and any
+    edit inside the first 64 KiB -- which is where every preview the model was shown comes
+    from -- is detected. An edit confined to the tail of a file larger than 64 KiB that
+    preserves its exact byte length is not detected. That is the trade-off, stated rather
+    than assumed.
+    """
+    h = hashlib.sha256()
+    h.update(f"{path.stat().st_size}:".encode())
+    with path.open("rb") as f:
+        h.update(f.read(_DIGEST_BYTES))
+    return h.hexdigest()
+
+
+class HandleTamperedError(RuntimeError):
+    """Raised when a handle's bytes changed after its metadata was derived.
+
+    Not a recoverable condition: the summary the model is holding describes data that is no
+    longer on disk, so continuing would feed it content nothing has vouched for.
+    """
+
+    def __init__(self, handle_id: str, path: str) -> None:
+        super().__init__(
+            f"handle {handle_id!r} ({path}) changed on disk after it was created: its "
+            f"content digest no longer matches the one recorded when its metadata was "
+            f"derived. The summary already in context describes different bytes. This is a "
+            f"tamper signal, not a recoverable condition -- save a new handle instead of "
+            f"overwriting an existing one."
+        )
+        self.handle_id = handle_id
 
 
 class HandleIdReuseError(ValueError):
@@ -36,10 +77,20 @@ class Handle:
     schema: dict[str, str] | None = None
     n_rows: int | None = None
     n_cols: int | None = None
+    # Integrity only, never shown to the model. ``None`` means nothing was recorded (a
+    # Handle built by hand, or a record predating digests) -- get() then has nothing to
+    # compare against and reads anyway.
+    digest: str | None = None
 
     def summary(self) -> dict[str, Any]:
-        """Context-facing view: drop None fields to keep it compact."""
-        return {k: v for k, v in asdict(self).items() if v is not None}
+        """Context-facing view: drop None fields to keep it compact.
+
+        The digest is dropped too: it is an internal integrity field, 64 hex characters of
+        pure noise in model context, and it is re-derived from the file on rehydration
+        rather than read back from the manifest.
+        """
+        return {k: v for k, v in asdict(self).items()
+                if v is not None and k != "digest"}
 
 
 class HandleStore:
@@ -102,14 +153,14 @@ class HandleStore:
         path = self.root / rel
         path.write_bytes(bytes(data))
         return Handle(id=hid, kind="binary", path=rel, source=source,
-                      **self._describe_binary(path))
+                      **self._describe("binary", path))
 
     def _write_dataframe(self, hid: str, df: Any, source: str) -> Handle:
         rel = f"handles/{hid}.parquet"
         path = self.root / rel
         df.to_parquet(path)
         return Handle(id=hid, kind="dataframe", path=rel, source=source,
-                      **self._describe_dataframe(path))
+                      **self._describe("dataframe", path))
 
     def _write_json(self, hid: str, obj: Any, source: str) -> Handle:
         # ``default=str`` keeps non-JSON-native types (datetime, Decimal, ...) from
@@ -118,14 +169,29 @@ class HandleStore:
         path = self.root / rel
         path.write_text(json.dumps(obj, default=str), encoding="utf-8")
         return Handle(id=hid, kind="json", path=rel, source=source,
-                      **self._describe_textual(path))
+                      **self._describe("json", path))
 
     def _write_text(self, hid: str, obj: str, source: str) -> Handle:
         rel = f"handles/{hid}.txt"
         path = self.root / rel
         path.write_text(obj, encoding="utf-8")
         return Handle(id=hid, kind="text", path=rel, source=source,
-                      **self._describe_textual(path))
+                      **self._describe("text", path))
+
+    def _describe(self, kind: str, path: Path) -> dict[str, Any]:
+        """Derive every described field for ``kind`` from the bytes at ``path``.
+
+        The single place metadata is produced: ``put``, ``adopt`` and manifest rehydration
+        all route through here, so a handle's summary always describes the file, whoever
+        wrote it. The integrity digest is taken here too, alongside the describer, so it is
+        recorded at exactly the moment the metadata it protects is derived.
+        """
+        describer = self._DESCRIBERS.get(kind)
+        if describer is None:
+            raise ValueError(f"unknown handle kind: {kind!r}")
+        described = getattr(self, describer)(path)
+        described["digest"] = _digest_file(path)
+        return described
 
     def _describe_dataframe(self, path: Path) -> dict[str, Any]:
         """Describe a parquet file without materializing it.
@@ -140,13 +206,18 @@ class HandleStore:
         pf = pq.ParquetFile(path)
         n_rows = int(pf.metadata.num_rows)
         schema_df = pf.schema_arrow.empty_table().to_pandas()
+        shown = 0
         if pf.num_row_groups:
             head = pf.read_row_group(0).slice(0, _PREVIEW_ROWS).to_pandas()
+            shown = len(head)
             preview = head.to_csv(index=False)
         else:
             preview = ""
-        if n_rows > _PREVIEW_ROWS:
-            preview += f"... ({_PREVIEW_ROWS} of {n_rows} rows)"
+        # Caption the rows actually shown, not _PREVIEW_ROWS: row group 0 may hold fewer
+        # than five rows (a file written with row_group_size=1 holds exactly one), and
+        # claiming five would describe a preview that isn't there.
+        if n_rows > shown:
+            preview += f"... ({shown} of {n_rows} rows)"
         return {
             "bytes": path.stat().st_size,
             "preview": preview,
@@ -181,19 +252,41 @@ class HandleStore:
             self._counter = max(self._counter, int(hid[1:]))
 
     def _register_record(self, record: dict[str, Any]) -> Handle:
-        """Register a handle whose file already exists (sandbox child, or manifest rehydration).
+        """Register a handle whose file already exists (manifest rehydration, or ``register``).
 
-        The ``path`` is supplied by lower-trust input, so it is run through ``safe_path``: a
-        record pointing outside the root is rejected here rather than read later.
+        **The record is untrusted.** The manifest lives at ``<root>/handles/_manifest.json``,
+        inside the session root that the container tier bind-mounts rw into the sandbox, so
+        sandboxed code can rewrite it and the next ``HandleStore(root)`` would read it back.
+        Only ``id``, ``kind``, ``path`` and ``source`` are taken from the record -- the
+        things the writer alone knows. Every described field (``preview``, ``bytes``,
+        ``schema``, ``n_rows``, ``n_cols``) is re-derived from the file by the same
+        ``_describe`` that ``put`` and ``adopt`` use, so a forged manifest cannot make the
+        model believe a false summary. The digest is re-derived too: the stored one offers
+        nothing, since whoever could forge the metadata could forge the digest beside it.
+
+        ``path`` goes through ``safe_path``, and the target must be a regular file -- a
+        record pointing outside the root, at a missing file, or at a directory/FIFO/device
+        is rejected here rather than hung on or read later.
         """
         try:
-            handle = Handle(**record)
-        except TypeError as e:  # contract boundary — give a useful message
+            hid, kind, path, source = (record["id"], record["kind"], record["path"],
+                                       record.get("source", "unknown"))
+        except (KeyError, TypeError) as e:  # contract boundary — give a useful message
             raise ValueError(f"invalid handle record {record!r}: {e}") from e
+        if not (isinstance(hid, str) and isinstance(path, str)):
+            raise ValueError(f"invalid handle record {record!r}: id and path must be strings")
         try:
-            safe_path(self.root, handle.path)
+            resolved = safe_path(self.root, path)
         except PathEscapesRootError as e:
             raise ValueError(f"handle record path escapes root: {record!r}") from e
+        # safe_path already resolved symlinks, so compare the unresolved path to catch them.
+        if not resolved.is_file() or (self.root / path).is_symlink():
+            raise ValueError(f"handle record path is not a regular file: {record!r}")
+        try:
+            handle = Handle(id=hid, kind=kind, path=path, source=source,
+                            **self._describe(kind, resolved))
+        except (OSError, TypeError) as e:  # unreadable file, or an unusable id/kind type
+            raise ValueError(f"invalid handle record {record!r}: {e}") from e
         self._handles[handle.id] = handle
         self._advance_counter(handle.id)
         return handle
@@ -223,7 +316,7 @@ class HandleStore:
         # already resolved symlinks, so compare against the unresolved path to catch them.
         if not resolved.is_file() or (self.root / path).is_symlink():
             raise ValueError(f"handle record path is not a regular file: {path!r}")
-        described = getattr(self, describer)(resolved)
+        described = self._describe(kind, resolved)
         handle = Handle(id=id, kind=kind, path=path, source=source, **described)
         self._handles[id] = handle
         self._advance_counter(id)
@@ -246,18 +339,25 @@ class HandleStore:
         tmp.replace(self._manifest_file)
 
     def _load_manifest(self) -> None:
-        """Restore handles + the id counter from a prior session on this root. Tolerant:
-        a corrupt record is skipped, not fatal."""
+        """Restore handles + the id counter from a prior session on this root.
+
+        The manifest is child-writable (see ``_register_record``), so nothing in it is
+        believed: each record is re-derived from its file. Tolerant by design -- a corrupt,
+        forged, or orphaned record is skipped, never fatal, and never aborts the records
+        after it.
+        """
         if not self._manifest_file.exists():
             return
         try:
             records = json.loads(self._manifest_file.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
             return
+        if not isinstance(records, dict):
+            return
         for record in records.values():
             try:
                 self._register_record(record)
-            except (ValueError, KeyError):
+            except Exception:  # noqa: BLE001 - a describer may raise anything on a corrupt file
                 continue
 
     def get(self, handle_id: str) -> Any:
@@ -266,6 +366,7 @@ class HandleStore:
         except KeyError:
             raise KeyError(f"no handle with id {handle_id!r}") from None
         path = safe_path(self.root, handle.path)  # defense-in-depth before any read
+        self._verify_digest(handle, path)
         if handle.kind == "dataframe":
             import pandas as pd
             return pd.read_parquet(path)
@@ -274,6 +375,24 @@ class HandleStore:
         if handle.kind == "binary":
             return str(path)  # binary content is opened by a library; hand back the path
         return path.read_text(encoding="utf-8")
+
+    def _verify_digest(self, handle: Handle, path: Path) -> None:
+        """Fail closed if a handle's bytes changed since its metadata was derived.
+
+        Metadata is derived once, at creation. Nothing stopped a later ``run_python`` from
+        overwriting the bytes under an existing handle without touching the control channel,
+        leaving the model holding a summary of data no longer on disk. Checked on the parent
+        side of every read, including ``binary`` handles -- those hand a path to a library
+        that is about to read it, which is the same exposure.
+
+        ``digest is None`` means nothing was recorded, so there is nothing to compare
+        against and the read proceeds. See ``_digest_file`` for what the digest does and
+        does not cover.
+        """
+        if handle.digest is None:
+            return
+        if _digest_file(path) != handle.digest:
+            raise HandleTamperedError(handle.id, handle.path)
 
     def summary(self, handle_id: str) -> dict[str, Any]:
         return self._handles[handle_id].summary()
