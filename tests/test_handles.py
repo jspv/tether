@@ -518,3 +518,68 @@ def test_dataframe_preview_caption_counts_the_rows_actually_shown(tmp_path):
     data_rows = [ln for ln in body.strip().splitlines()[1:] if ln]   # drop the CSV header
     assert f"({len(data_rows)} of 20 rows)" in described["preview"]
     assert len(data_rows) == 1
+
+
+# --- host-ingested inputs ----------------------------------------------------------------
+
+def _input_file(tmp_path, rel, data=b"x"):
+    """An input's bytes must really be on disk: put_input derives its record from them."""
+    path = tmp_path / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(data)
+    return path
+
+
+def test_put_input_registers_binary_handle(tmp_path):
+    store = HandleStore(tmp_path)
+    _input_file(tmp_path, "inputs/f1/a.csv")
+    h = store.put_input(path="inputs/f1/a.csv", source="upload:a.csv",
+                        input_id="f1", content_type="text/csv", description="d")
+    assert (h.kind, h.input_id, h.content_type, h.description) == ("binary", "f1", "text/csv", "d")
+    assert store.inputs() == {"f1": h}
+    assert store.get(h.id) == str((tmp_path / "inputs/f1/a.csv").resolve())
+
+
+def test_put_input_is_idempotent_and_survives_reload(tmp_path):
+    store = HandleStore(tmp_path)
+    _input_file(tmp_path, "inputs/f1/a.csv")
+    _input_file(tmp_path, "inputs/f1/b.csv", b"other")
+    h = store.put_input(path="inputs/f1/a.csv", source="s", input_id="f1")
+    assert store.put_input(path="inputs/f1/b.csv", source="s", input_id="f1") == h
+    assert HandleStore(tmp_path).inputs() == {"f1": h}
+
+
+def test_put_input_rejects_escaping_path(tmp_path):
+    with pytest.raises(ValueError):
+        HandleStore(tmp_path).put_input(path="../x", source="s", input_id="f1")
+
+
+def test_non_input_summary_has_no_input_fields(tmp_path):
+    s = HandleStore(tmp_path).put("hello", source="t").summary()
+    assert not {"input_id", "content_type", "description"} & s.keys()
+
+
+def test_put_input_replace_keeps_id_and_persists(tmp_path):
+    store = HandleStore(tmp_path)
+    _input_file(tmp_path, "inputs/f1/a.csv")
+    _input_file(tmp_path, "inputs/f1/b.csv", b"yy")
+    h = store.put_input(path="inputs/f1/a.csv", source="s", input_id="f1")
+    h2 = store.put_input(path="inputs/f1/b.csv", source="s2", input_id="f1", replace=True)
+    assert h2.id == h.id and h2.path == "inputs/f1/b.csv"
+    assert HandleStore(tmp_path).inputs()["f1"].path == "inputs/f1/b.csv"
+
+
+def test_rehydrated_input_drops_host_description_and_rederives_the_rest(tmp_path):
+    """A record carrying input_id keeps only that: everything else comes from the bytes.
+
+    ``description`` reaches model context and is not recoverable from the file, so a
+    manifest sandboxed code can rewrite must not be able to supply one."""
+    store = HandleStore(tmp_path)
+    _input_file(tmp_path, "inputs/f1/a.csv", b"col\n1\n")
+    h = store.put_input(path="inputs/f1/a.csv", source="s", input_id="f1", description="d")
+    assert h.description == "d"
+
+    reloaded = HandleStore(tmp_path).inputs()["f1"]
+    assert reloaded.description is None
+    assert reloaded.content_type == "text/csv" and "col" in reloaded.preview
+    assert reloaded.digest == h.digest

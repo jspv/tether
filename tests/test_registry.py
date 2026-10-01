@@ -15,6 +15,7 @@ def test_build_tools_returns_expected_named_callables(tmp_path):
         "read_file", "write_file", "list_files", "search",
         "fetch_url", "run_python", "inspect_handle",
         "web_search", "web_extract", "read_document",
+        "publish_file", "publish_handle",   # filtered by Session.tools() without on_publish
     }
 
 

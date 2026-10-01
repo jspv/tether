@@ -4,8 +4,11 @@ from .api import Tether, Result, ToolFactory, solve, tool_factory
 from .config import FetchConfig, TetherConfig, SandboxConfig
 from .handles import Handle, HandleStore
 from .paths import PathEscapesRootError, safe_path
-from .sandbox import ExecResult, LocalSubprocessSandbox, SandboxExecutor, SandboxRuntimeUnavailable
-from .sandbox import NoSandboxIsolationWarning
+from .publish import OnPublish, PublishedFile, PublishError
+from .container_runtime import (PreflightReport, SandboxImageError, SandboxImageMissing,
+                                sandbox_preflight)
+from .sandbox import (ExecResult, LocalSubprocessSandbox, NoSandboxIsolationWarning,
+                      SandboxExecutor, SandboxRuntimeUnavailable)
 from .sandbox_container import ContainerSandbox
 from .session import Session
 from .conversation import Conversation
@@ -20,7 +23,10 @@ __all__ = [
     "FetchConfig", "TetherConfig", "SandboxConfig",
     "Handle", "HandleStore",
     "PathEscapesRootError", "safe_path",
-    "ExecResult", "LocalSubprocessSandbox", "SandboxExecutor", "SandboxRuntimeUnavailable", "NoSandboxIsolationWarning",
+    "OnPublish", "PublishedFile", "PublishError",
+    "ExecResult", "LocalSubprocessSandbox", "SandboxExecutor", "SandboxRuntimeUnavailable",
+    "NoSandboxIsolationWarning",
+    "PreflightReport", "SandboxImageError", "SandboxImageMissing", "sandbox_preflight",
     "ContainerSandbox",
     "Session",
     "Conversation", "SessionManager",

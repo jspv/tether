@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import mimetypes
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -13,6 +14,10 @@ from .paths import PathEscapesRootError, safe_path
 _PREVIEW_CHARS = 800
 _PREVIEW_ROWS = 5
 _DIGEST_BYTES = 64 * 1024
+# Uploaded-input previews: raw first lines, for text-like extensions only. Never parsed.
+_TEXT_PREVIEW_EXTS = {".csv", ".tsv", ".txt", ".json", ".md"}
+_PREVIEW_LINES = 5
+_PREVIEW_READ_BYTES = 4096
 
 
 def _digest_file(path: Path) -> str:
@@ -69,7 +74,7 @@ class HandleIdReuseError(ValueError):
 @dataclass
 class Handle:
     id: str
-    kind: str  # "json" | "text" | "dataframe"
+    kind: str  # "json" | "text" | "dataframe" | "binary"
     path: str  # POSIX path relative to the session root
     source: str
     bytes: int
@@ -77,6 +82,9 @@ class Handle:
     schema: dict[str, str] | None = None
     n_rows: int | None = None
     n_cols: int | None = None
+    input_id: str | None = None       # host-supplied id of an uploaded input
+    content_type: str | None = None   # advisory type of an uploaded input
+    description: str | None = None    # host-supplied description of an uploaded input
     # Integrity only, never shown to the model. ``None`` means nothing was recorded (a
     # Handle built by hand, or a record predating digests) -- get() then has nothing to
     # compare against and reads anyway.
@@ -282,9 +290,23 @@ class HandleStore:
         # safe_path already resolved symlinks, so compare the unresolved path to catch them.
         if not resolved.is_file() or (self.root / path).is_symlink():
             raise ValueError(f"handle record path is not a regular file: {record!r}")
+        # ``input_id`` is the one record field that cannot be derived from the bytes: it
+        # names *which* host upload this file is, and losing it on rehydration would break
+        # add_input's idempotency across restarts. It is carried, not believed -- Session
+        # re-checks a recorded input against the filesystem and against the host's bytes
+        # before reusing it. ``content_type`` is re-derived from the filename and
+        # ``description`` is dropped: both reach model context, and neither is recoverable
+        # from a manifest sandboxed code can rewrite.
+        input_id = record.get("input_id") if isinstance(record, dict) else None
+        if not (isinstance(input_id, str) and input_id):
+            input_id = None
         try:
-            handle = Handle(id=hid, kind=kind, path=path, source=source,
-                            **self._describe(kind, resolved))
+            if input_id is not None:
+                handle = Handle(id=hid, kind="binary", path=path, source=source,
+                                input_id=input_id, **self._describe_input(resolved, None))
+            else:
+                handle = Handle(id=hid, kind=kind, path=path, source=source,
+                                **self._describe(kind, resolved))
         except (OSError, TypeError) as e:  # unreadable file, or an unusable id/kind type
             raise ValueError(f"invalid handle record {record!r}: {e}") from e
         self._handles[handle.id] = handle
@@ -322,6 +344,63 @@ class HandleStore:
         self._advance_counter(id)
         self._save_manifest()
         return handle
+
+    def put_input(self, *, path: str, source: str, input_id: str,
+                  size: int | None = None, preview: str | None = None,
+                  content_type: str | None = None, description: str | None = None,
+                  replace: bool = False) -> Handle:
+        """Register a host-ingested upload whose file already exists under ``inputs/``.
+
+        Parent-authored (the host wrote the bytes), so it does not go through the sandbox
+        adoption path. Idempotent by ``input_id``: an existing input is returned unchanged,
+        unless ``replace`` is set, which overwrites its record and keeps its handle id.
+
+        ``size`` and ``preview`` are accepted for call compatibility but **ignored**: like
+        every other handle, an input's described fields are derived here from the bytes on
+        disk, by the one describer that ``_register_record`` also uses on rehydration. That
+        parity is what lets a reopened store reproduce the record exactly instead of
+        believing the (child-writable) manifest.
+        """
+        existing = self.inputs().get(input_id)
+        if existing is not None and not replace:
+            return existing
+        try:
+            resolved = safe_path(self.root, path)
+        except PathEscapesRootError as e:
+            raise ValueError(f"input path escapes root: {path!r}") from e
+        hid = existing.id if existing is not None else self._new_id()
+        handle = Handle(id=hid, kind="binary", path=path, source=source, input_id=input_id,
+                        description=description,
+                        **self._describe_input(resolved, content_type))
+        self._handles[handle.id] = handle
+        self._save_manifest()
+        return handle
+
+    def _describe_input(self, path: Path, content_type: str | None) -> dict[str, Any]:
+        """Derive an uploaded input's described fields from its bytes.
+
+        Uploads are untrusted and are **never parsed**: the preview is the name/size/type
+        line plus, for text-like extensions, the first few raw lines. ``content_type`` falls
+        back to what the filename implies, so the value is reproducible from the file alone
+        and a rehydrated record matches the one ``put_input`` wrote.
+        """
+        size = path.stat().st_size
+        filename = path.name
+        ctype = content_type or mimetypes.guess_type(filename)[0]
+        head = f"<uploaded file {filename}, {size} bytes, {ctype or 'unknown type'}>"
+        if Path(filename).suffix.lower() not in _TEXT_PREVIEW_EXTS:
+            preview = head
+        else:
+            with path.open("rb") as f:
+                raw = f.read(_PREVIEW_READ_BYTES)
+            lines = raw.decode("utf-8", errors="replace").splitlines()[:_PREVIEW_LINES]
+            preview = (head + "\n" + "\n".join(lines))[:_PREVIEW_CHARS]
+        return {"bytes": size, "preview": preview, "content_type": ctype,
+                "digest": _digest_file(path)}
+
+    def inputs(self) -> dict[str, Handle]:
+        """Uploaded inputs, keyed by host-supplied ``input_id``."""
+        return {h.input_id: h for h in self._handles.values() if h.input_id is not None}
 
     @property
     def _manifest_file(self) -> Path:

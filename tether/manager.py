@@ -68,13 +68,18 @@ class SessionManager:
         return self._ttl is not None and (time.monotonic() - conv.last_activity) > self._ttl
 
     async def aopen(self, session_id: str | None = None, *, tools: list | None = None,
-                    bundles: tuple[str, ...] | None = None) -> Conversation:
+                    bundles: tuple[str, ...] | None = None,
+                    agent_instructions: str | None = None,
+                    on_publish: Any | None = None) -> Conversation:
         """Reuse the live conversation for ``session_id`` (if any, not expired), else create one.
 
         Open-or-create is serialized behind a single manager lock so a concurrent ``aopen`` of the
         same id returns the same Conversation rather than racing two builds. The lock is held across
         ``Conversation.acreate`` (which connects MCP), so a slow connect for one id delays other
         opens — acceptable at v1's scale; a per-id lock is the fast-follow if it bites.
+
+        ``agent_instructions`` and ``on_publish`` override the Tether defaults for a conversation
+        being *created*; re-opening a live id returns the existing conversation unchanged.
         """
         async with self._lock:
             if session_id is not None:
@@ -94,6 +99,10 @@ class SessionManager:
                 tools=expand_tools(self._tether._tools) + expand_tools(tools),
                 bundles=bundles if bundles is not None else self._tether._bundles,
                 reap_on_close=True,
+                agent_instructions=(agent_instructions if agent_instructions is not None
+                                    else self._tether._agent_instructions),
+                on_publish=(on_publish if on_publish is not None
+                            else self._tether._on_publish),
             )
             self._store.put(conv_id, conv)
             return conv

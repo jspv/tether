@@ -33,6 +33,7 @@ This is **v1: the general substrate**. Specific problems plug in later as user-s
   - [Use it as a MAF agent](#use-it-as-a-maf-agent)
   - [Bring your own model client](#bring-your-own-model-client)
   - [Sessions: one-shot vs continuous](#sessions-one-shot-vs-continuous)
+  - [Exchanging files with the user](#exchanging-files-with-the-user)
   - [MCP servers](#mcp-servers)
   - [Live status updates](#live-status-updates)
   - [AG-UI and CopilotKit](#ag-ui-and-copilotkit)
@@ -150,6 +151,7 @@ The quickstarts above and the guides below are each worked examples. Two runnabl
 | [Use it as a MAF agent](#use-it-as-a-maf-agent) | Building and driving the agent with the ordinary MAF agent surface (`run` / streaming / threads / workflows) |
 | [Bring your own model client](#bring-your-own-model-client) | Injecting an Azure / Foundry / custom-auth chat client |
 | [Sessions: one-shot vs continuous](#sessions-one-shot-vs-continuous) | Persistent multi-turn conversations with a shared workspace |
+| [Exchanging files with the user](#exchanging-files-with-the-user) | Delivering output files to a host and ingesting uploads |
 | [MCP servers](#mcp-servers) | Plugging in stdio / remote MCP servers |
 | [Live status updates](#live-status-updates) | Streaming tool progress to a callback or the CLI |
 
@@ -248,7 +250,54 @@ async def main():
 asyncio.run(main())
 ```
 
+**Agent instructions.** Give the agent your domain system prompt with `agent_instructions` — on `Tether(...)` as the default for every conversation, or per conversation on `aopen(...)` (which wins when both are set); `solve`/`asolve` accept it too. MAF layers it *after* tether's operating manual: `<core + bundle instructions>`, a blank line, then `<agent_instructions>`. Leave tool mechanics to tether and put the data model, workflow, and conventions in yours. The per-conversation value applies when a conversation is created; re-opening a live id returns the existing agent.
+
+```python
+h = Tether(cfg, agent_instructions=SYSTEM_PROMPT)
+conv = await h.aopen("thread-42", agent_instructions=OTHER_PROMPT)   # optional override
+```
+
 AG-UI hosts get this automatically — `agui_stream` maps each request's `threadId` to a persistent conversation, so handles and files persist across turns (history stays in the AG-UI message replay).
+
+### Exchanging files with the user
+
+**Delivering files.** Pass `on_publish` (on `Tether(...)`, or per conversation on `aopen`) and
+select the `deliver` bundle. The model writes a file under `outputs/` and calls `publish_file`
+(or `publish()` inside `run_python`, or `publish_handle` for a handle). Tether validates every
+request in the parent — inside the root, a regular file and not a symlink, not under
+`handles/` or `.scripts/` or a control file, at most `max_publish_bytes` — then calls your
+callback with a `PublishedFile(path, rel_path, name, size, sha256, content_type, description,
+source)`. `path` is a private snapshot outside the workspace, copied from the validated bytes;
+copy it during the callback — it is deleted when the callback returns. Its return
+value reaches the model under `"host"`; if it raises, the tool returns an error and the run
+continues. The callback runs synchronously in the tool call's context (so your contextvars are
+visible) but possibly on a worker thread — make it thread-safe. Sandbox `publish()` requests
+are processed after the script exits cleanly. Both the tools and `publish()` require the
+`deliver` bundle **and** a callback; without either, they are not available to the model.
+
+```python
+from tether import PublishedFile, Tether
+
+def host_publish(pf: PublishedFile) -> dict:
+    file_id = storage.copy_in(pf.path, name=pf.name, run=CURRENT_RUN.get())
+    return {"file_id": file_id, "label": pf.name}
+
+h = Tether(cfg, bundles=("code", "files", "deliver"), on_publish=host_publish)
+```
+
+**Receiving files.** Between turns, hand uploads to the conversation:
+
+```python
+handle = conv.add_input(upload_bytes, input_id=upload.id, name=upload.filename)
+# or: await conv.aadd_input(...)   # waits for a running turn instead of raising
+```
+
+The file lands at `inputs/<input_id>/<name>` (read-only; mounted `:ro` in the container tier)
+and becomes a `binary` handle — `load(id)` in `run_python` returns its path. It is idempotent by
+`input_id`, survives a restart on the same root, is capped by `max_input_bytes`, and is
+**never parsed in the host process** (the preview is name/size/type plus raw first lines for
+text files). `conv.inputs` lists them. Note: `read_document` on an input parses it with Docling
+**in the host process**; prefer reading uploads inside `run_python` when isolation matters.
 
 ### MCP servers
 
@@ -367,13 +416,15 @@ The agent gets a small, fixed set of root-confined tools (listed below; the web 
 | `web_search(query, max_results=5)` | Tavily web search (needs `TAVILY_API_KEY`) |
 | `web_extract(url)` | Tavily clean-content extraction (needs `TAVILY_API_KEY`) |
 | `read_document(source)` | A workspace path or URL → clean markdown handle (tables preserved) via Docling; needs the `docling` extra |
+| `publish_file(path, name=None, description=None)` | Deliver a workspace file to the host (`deliver` bundle; only with `on_publish`) |
+| `publish_handle(handle_id, format=None, name=None)` | Deliver a handle as csv/xlsx/parquet/json (`deliver` bundle; only with `on_publish`) |
 
 ### Security and confinement
 
 Every session has one **root directory**; everything — handles, agent-written scripts, reads/writes, the sandbox `cwd` — lives under it.
 
 - **Layer 1 — Tool path-jail (guaranteed).** All model-supplied paths route through one chokepoint, `safe_path(root, p)`, which resolves symlinks *before* checking and rejects any path outside the root (blocks `..`, absolute paths, symlink escapes). It's the most heavily tested code in the project.
-- **Layer 2 — Executed code.** `run_python` runs in the **container** tier by default: a hardened Podman/Docker container (network off, read-only root filesystem, dropped capabilities, non-root, memory/cpu/pid limits) — see [Sandbox tiers](#sandbox-tiers). If no usable container runtime is present, building the sandbox is a hard error (`SandboxRuntimeUnavailable`) that names the `local` opt-out; it never falls back silently. The `local` tier provides **no isolation**: the code runs as the host user. Use it only when you have chosen that deliberately.
+- **Layer 2 — Executed code.** `run_python` runs in the **container** tier by default: a hardened Podman/Docker container (network off, read-only root filesystem, dropped capabilities, non-root, memory/cpu/pid limits) — see [Sandbox tiers](#sandbox-tiers). If no usable container runtime is present, building the sandbox is a hard error (`SandboxRuntimeUnavailable`) that names the `local` opt-out; it never falls back silently. **The `local` tier is not a security boundary**: the code runs as the host user, with that user's file and network access, in a scrubbed-env subprocess with `resource` rlimits and a wall-clock timeout. Use it only when you have chosen that deliberately. A host that must not be able to opt out sets `SandboxConfig.require_isolation=True`, which refuses the local tier however it was selected — see [Sandbox tiers](#sandbox-tiers).
 - **Layer 3 — Egress.** The model chooses the URLs the harness fetches, so egress is filtered. `fetch_url` and `read_document(url)` deny loopback, private, link-local, reserved, multicast and unspecified addresses by default, plus `100.64.0.0/10` (RFC 6598 carrier-grade NAT), which no standard `ipaddress` flag reports as private and so is denied explicitly. The harness follows redirects itself (`follow_redirects=False` is forced on every request), so **every hop is re-validated**. `read_document` downloads through the same guard and hands Docling a local path, never a URL, so Docling cannot follow its own redirects outside policy. To reach an internal data source, name it in `FetchConfig.allow_private_hosts` (hostnames or CIDRs).
   - **Cloud metadata endpoints are denied unconditionally and cannot be allowlisted.** `allow_private_hosts` cannot open them, by design: `169.254.169.254`, `169.254.170.2`, `168.63.129.16`, `100.100.100.200`, `192.0.0.192` and `fd00:ec2::254`. Note `168.63.129.16` (Azure's wireserver) is a *public* address that nothing else would block; Azure users should expect it to be refused.
   - Known residual: the host is resolved for validation and then resolved again by the HTTP client, so a DNS-rebinding race is not closed (IP pinning is on the [roadmap](docs/ROADMAP.md)). `web_search` / `web_extract` call a fixed Tavily endpoint and are not filtered; an MCP server you install makes its own network calls, which the harness cannot filter.
@@ -401,7 +452,28 @@ cfg = TetherConfig(sandbox=SandboxConfig(
 Tether(cfg).solve("…")
 ```
 
-The image (Python + `preinstalled` libraries) is **built automatically on first use** and cached; run `tether-build-sandbox` to pre-build it in CI/deploy. Notes: on macOS the runtime runs in a Linux VM, so the session root must sit under a VM-shared path (the default `~/.tether/...` is); the container tier does not enforce `max_file_size_mb` (memory/pid/cpu/network are enforced instead). The explicit `network=True` option exposes the container to the network; the egress guard applies to the harness's own fetches, not to code running in the sandbox.
+**Requiring isolation.** The container tier is already the default, so `require_isolation=True` is the stricter assertion on top of it: it refuses the local tier *however it was selected* — an explicit `backend="local"`, or `TETHER_SANDBOX_BACKEND=local` in the environment — with `SandboxRuntimeUnavailable` at `Session.create`, not on first use. A missing runtime or image raises; tether never falls back to the local tier. Set it on any host where no deployment mistake may quietly turn isolation off.
+
+**Image readiness.** Runtime liveness and image readiness are different questions. Selecting the container tier probes the runtime with `<runtime> info` and raises `SandboxRuntimeUnavailable` if it is absent or not responding; whether the *image* is built is checked separately. By default the image (Python + `preinstalled` libraries) and any `pip_packages` layer are **built on first use** and cached — which, with `container` as the default backend, is what an out-of-the-box run does. `build_on_demand` controls this; its default (`None`) means "build unless `require_isolation`", so a host that demands isolation is also required to pre-build rather than discover a build on the first request. With builds disabled, a missing image makes `run_python` fail immediately with `SandboxImageMissing`, naming the exact command to run. Builds that do run are bounded by `build_timeout_s` (`SandboxImageError` on expiry); it is one
+budget for the image build and the pip layer together. A timed-out pip-layer container is
+removed, but a timed-out image build may finish in the runtime's background. Pre-build exactly what a host will ask for, and gate startup on a non-mutating preflight:
+
+```bash
+tether-build-sandbox --preinstalled pandas pyarrow numpy httpx --pip rich   # build image + layer
+tether-build-sandbox --pip rich --check                                    # report only; exit 1 on problems
+```
+
+```python
+from tether import sandbox_preflight
+from tether.config import SandboxConfig
+
+cfg = SandboxConfig(backend="container", require_isolation=True)   # build_on_demand -> False
+report = sandbox_preflight(cfg)        # never builds; `image inspect` is time-bounded
+if not report.ok:
+    raise RuntimeError("; ".join(report.problems))
+```
+
+Notes: on macOS the runtime runs in a Linux VM, so the session root must sit under a VM-shared path (the default `~/.tether/...` is); the container tier does not enforce `max_file_size_mb` (memory/pid/cpu/network are enforced instead). The explicit `network=True` option exposes the container to the network; the egress guard applies to the harness's own fetches, not to code running in the sandbox.
 
 ### Configuration
 
@@ -416,7 +488,9 @@ The image (Python + `preinstalled` libraries) is **built automatically on first 
 | `max_output_tokens` | `4096` | |
 | `root_dir` | `None` | `None` → a session dir under `./.tether/sessions/` |
 | `idle_ttl_s` | `None` | Continuous-session idle TTL; `None` → never expire |
-| `sandbox` | `SandboxConfig()` | `backend` (`container` by default; `local` = no isolation), `container_runtime`, timeout, limits, network, `pip_packages`, preinstalled libs. **`max_file_size_mb` is enforced by the `local` tier only** — under the default `container` backend it has no effect (memory/cpu/pid limits and the network setting apply instead) |
+| `max_publish_bytes` | `100 MiB` | Largest file `publish_file` / `publish()` will deliver |
+| `max_input_bytes` | `100 MiB` | Largest upload `add_input` will accept |
+| `sandbox` | `SandboxConfig()` | `backend` (`container` by default; `local` = no isolation), `container_runtime`, timeout, limits, network, `pip_packages`, preinstalled libs, `require_isolation` (`False` — refuses a non-container backend however it was selected), `build_on_demand` (`None` → build unless isolation is required), `build_timeout_s` (`900`). **`max_file_size_mb` is enforced by the `local` tier only** — under the default `container` backend it has no effect (memory/cpu/pid limits and the network setting apply instead) |
 | `fetch` | `FetchConfig()` | `max_bytes`, timeout, allowed URL schemes |
 | `fetch.allow_private_hosts` | `()` | Hostnames or CIDRs exempted from the internal-address denylist, for internal data sources. Cloud metadata endpoints cannot be allowlisted |
 | `fetch.max_redirects` | `5` | Redirect hops followed (each re-validated); more raises an error |

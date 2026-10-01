@@ -5,6 +5,7 @@ Communicates with the parent tether only via env vars and files:
   TETHER_REGISTRY     json file: { handle_id: {kind, path} } for existing handles
   TETHER_NEW_HANDLES  jsonl file this module appends new-handle records to
   TETHER_EMIT         json file this module writes the emit() payload to
+  TETHER_PUBLISH      jsonl file publish() appends requests to (absent: publishing disabled)
 """
 
 from __future__ import annotations
@@ -71,3 +72,22 @@ def save(handle_id: str, obj: Any, source: str = "run_python") -> str:
 
 def emit(obj: Any) -> None:
     _EMIT.write_text(json.dumps(obj, default=str), encoding="utf-8")
+
+
+def publish(path: str, name: str | None = None, description: str | None = None) -> None:
+    """Ask the host to deliver a finished workspace file to the user.
+
+    The request is recorded here and processed by the parent after this script exits cleanly
+    (the parent re-validates it; this side is not trusted). Raises if the host has not enabled
+    publishing for this session.
+    """
+    target = os.environ.get("TETHER_PUBLISH")
+    if not target:
+        raise RuntimeError("publishing is not enabled for this session "
+                           "(the host has not configured a publish callback)")
+    p = os.path.abspath(os.fspath(path))
+    root = os.path.abspath(str(_ROOT))
+    if os.path.commonpath([p, root]) == root:
+        p = os.path.relpath(p, root)   # convenience: /workspace/x -> x (not a trust step)
+    with open(target, "a", encoding="utf-8") as f:
+        f.write(json.dumps({"path": p, "name": name, "description": description}) + "\n")

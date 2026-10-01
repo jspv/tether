@@ -14,10 +14,14 @@ import time
 from typing import TYPE_CHECKING, Any
 
 from .config import TetherConfig
+from .publish import OnPublish
 from .session import Session
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from .api import Result
+    from .handles import Handle
 
 
 class Conversation:
@@ -35,12 +39,18 @@ class Conversation:
     @classmethod
     async def acreate(cls, *, id: str, config: TetherConfig, client: Any,
                       tools: list | None = None, bundles: tuple[str, ...] = ("code", "files", "web"),
-                      reap_on_close: bool = True) -> "Conversation":
-        """Open the workspace, build the agent once, start a MAF conversation thread."""
-        session = Session.create(config)
+                      reap_on_close: bool = True,
+                      agent_instructions: str | None = None,
+                      on_publish: OnPublish | None = None) -> "Conversation":
+        """Open the workspace, build the agent once, start a MAF conversation thread.
+
+        ``agent_instructions`` (the host's domain system prompt) is appended after tether's
+        operating manual by MAF: ``<core + bundle instructions>\\n\\n<agent_instructions>``.
+        """
+        session = Session.create(config, on_publish=on_publish, bundles=bundles)
         await session.__aenter__()
         try:
-            agent = await session.create_agent(client, agent_instructions=None,
+            agent = await session.create_agent(client, agent_instructions=agent_instructions,
                                                 tools=tools or [], bundles=bundles)
             agent_session = agent.create_session(session_id=id)
         except BaseException:
@@ -62,6 +72,33 @@ class Conversation:
             self.last_activity = time.monotonic()
             return Result(final_text=final_text, handles=dict(self.session.handles),
                           files=self.session.artifacts, session_dir=self.session.root, error=error)
+
+    @property
+    def inputs(self) -> dict[str, "Handle"]:
+        """User-provided inputs in this conversation's workspace, by ``input_id``."""
+        return self.session.inputs
+
+    def add_input(self, source: "Path | bytes", *, input_id: str, name: str,
+                  content_type: str | None = None,
+                  description: str | None = None) -> "Handle":
+        """Ingest a user upload between turns (see ``Session.add_input``).
+
+        Raises ``RuntimeError`` while a turn is running; use ``aadd_input`` to wait instead.
+        """
+        if self._lock.locked():
+            raise RuntimeError("cannot add an input while a turn is running; use aadd_input()")
+        return self.session.add_input(source, input_id=input_id, name=name,
+                                      content_type=content_type, description=description)
+
+    async def aadd_input(self, source: "Path | bytes", *, input_id: str, name: str,
+                         content_type: str | None = None,
+                         description: str | None = None) -> "Handle":
+        """Ingest a user upload, waiting for any running turn to finish first. The copy runs
+        in a worker thread so a large upload does not stall the event loop."""
+        async with self._lock:
+            return await asyncio.to_thread(
+                self.session.add_input, source, input_id=input_id, name=name,
+                content_type=content_type, description=description)
 
     async def aclose(self) -> None:
         """Tear down the workspace (MCP + bus), then reap the root unless retained. Idempotent."""

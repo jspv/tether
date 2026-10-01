@@ -11,12 +11,15 @@ from __future__ import annotations
 import json
 import os
 import resource
+import secrets
+import stat
 import subprocess
 import sys
 import tempfile
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 from .config import SandboxConfig
 from .handles import HandleIdReuseError, HandleStore
@@ -27,14 +30,16 @@ _RUNNER = _RUNTIME_DIR / "_runner.py"
 _SCRIPTS_DIR = ".scripts"
 _MAX_REPORTED_IDS = 5   # distinct rejected ids named in an error message
 _MAX_REPORTED_ID_LEN = 64
+# Bounds on the child -> parent publish channel; requests are untrusted input.
+_MAX_PUBLISH_CONTROL_BYTES = 1024 * 1024
+_MAX_PUBLISH_REQUESTS = 64
+
+# publisher(path, *, name, description, source) -> result record (see Session.publish)
+Publisher = Callable[..., dict]
 
 
 class NoSandboxIsolationWarning(UserWarning):
     """Raised when the local tier is selected: sandboxed code runs as the host user."""
-
-
-class SandboxRuntimeUnavailable(RuntimeError):
-    """Raised when the container backend is selected but no container runtime exists."""
 
 
 @dataclass
@@ -46,6 +51,12 @@ class ExecResult:
     exit_code: int
     new_handles: list[str] = field(default_factory=list)
     killed_by: str | None = None
+    published: list[dict] = field(default_factory=list)
+
+
+class SandboxRuntimeUnavailable(RuntimeError):
+    """Raised when the container backend is selected but no container runtime exists, or when
+    isolation is required and the selected backend cannot provide it."""
 
 
 @dataclass
@@ -83,13 +94,16 @@ class _RunContext:
     new_handles_file: Path   # host path
     emit_file: Path          # host path
     config: SandboxConfig
+    publish_file: Path | None = None   # host path; None when publishing is disabled
 
 
 class _OrchestratedSandbox:
     """Shared control-file orchestration. Subclasses implement ``_launch``.
 
-    Sequential and NOT re-entrant per root: each run uses per-run-unique control files
-    (keyed by pid + run counter), so sequential runs never clobber each other.
+    Runs are serialized by ``self.lock`` (an ``RLock`` the Session also takes for its own file
+    work in the root -- publishing, input ingestion), so no sandboxed code is running while the
+    parent validates or writes paths under the child-writable root. Each run's control files use
+    a random token, so sandboxed code cannot pre-plant a link at a future run's control path.
     """
 
     def __init__(self, root: Path | str, store: HandleStore,
@@ -99,30 +113,40 @@ class _OrchestratedSandbox:
         self.store = store
         self.config = config or SandboxConfig()
         self.limits = limits or ControlPlaneLimits()
-        self._run_counter = 0
+        self.publisher: Publisher | None = None   # set by Session when the host can receive files
+        self.lock = threading.RLock()             # shared with the Session; see class docstring
 
     def run_code(self, code: str, args: list[str] | None = None) -> ExecResult:
-        scripts = self.root / _SCRIPTS_DIR
-        scripts.mkdir(exist_ok=True)
-        # Collision-free across instances/processes; scripts persist as debuggable artifacts.
-        fd, abspath = tempfile.mkstemp(prefix="inline_", suffix=".py", dir=scripts)
-        os.close(fd)
-        Path(abspath).write_text(code, encoding="utf-8")
-        rel = str(Path(abspath).relative_to(self.root))
-        return self.run_script(rel, args)
+        with self.lock:
+            scripts = self.root / _SCRIPTS_DIR
+            scripts.mkdir(exist_ok=True)
+            # Collision-free across instances/processes; scripts persist as debuggable artifacts.
+            fd, abspath = tempfile.mkstemp(prefix="inline_", suffix=".py", dir=scripts)
+            os.close(fd)
+            Path(abspath).write_text(code, encoding="utf-8")
+            rel = str(Path(abspath).relative_to(self.root))
+            return self.run_script(rel, args)
 
     def run_script(self, path: str, args: list[str] | None = None) -> ExecResult:
+        with self.lock:
+            return self._run_script(path, args)
+
+    def _run_script(self, path: str, args: list[str] | None) -> ExecResult:
         script = safe_path(self.root, path)  # raises PathEscapesRootError if outside
         argv = [str(a) for a in (args or [])]  # coerce so non-str args fail clearly, not opaquely
 
-        self._run_counter += 1
-        token = f"{os.getpid()}_{self._run_counter}"
+        token = secrets.token_hex(8)
         new_handles_file = self.root / f"_new_handles_{token}.jsonl"
         emit_file = self.root / f"_emit_{token}.json"
         registry_file = self.root / f"_registry_{token}.json"
+        publish_file = self.root / f"_publish_{token}.jsonl" if self.publisher else None
 
         try:
             new_handles_file.write_text("", encoding="utf-8")
+            if publish_file is not None:
+                # Exclusive + no-follow: never truncate or adopt something planted at this path.
+                os.close(os.open(publish_file,
+                                 os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600))
             registry = {hid: {"kind": h.kind, "path": h.path}
                         for hid, h in self.store.manifest_handles().items()}
             registry_file.write_text(json.dumps(registry), encoding="utf-8")
@@ -130,7 +154,7 @@ class _OrchestratedSandbox:
             ctx = _RunContext(
                 script_rel=str(script.relative_to(self.root)), argv=argv, root=self.root,
                 registry_file=registry_file, new_handles_file=new_handles_file,
-                emit_file=emit_file, config=self.config,
+                emit_file=emit_file, config=self.config, publish_file=publish_file,
             )
             launched = self._launch(ctx)
 
@@ -163,14 +187,20 @@ class _OrchestratedSandbox:
                 result = launched.stdout.strip()
 
             new_handles, ingest_error = self._ingest_new_handles(new_handles_file)
+            published, publish_error = self._process_publications(publish_file,
+                                                                  launched.exit_code)
             base_error = (launched.stderr.strip() or None) if launched.exit_code != 0 else None
-            error = "\n".join(p for p in (base_error, emit_error, ingest_error) if p) or None
+            error = "\n".join(p for p in (base_error, emit_error, ingest_error, publish_error)
+                               if p) or None
 
             return ExecResult(stdout=launched.stdout, stderr=launched.stderr, result=result,
                               error=error, exit_code=launched.exit_code,
-                              new_handles=new_handles, killed_by=launched.killed_by)
+                              new_handles=new_handles, killed_by=launched.killed_by,
+                              published=published)
         finally:
-            for f in (new_handles_file, emit_file, registry_file):
+            for f in (new_handles_file, emit_file, registry_file, publish_file):
+                if f is None:
+                    continue
                 try:
                     f.unlink(missing_ok=True)
                 except OSError:
@@ -217,6 +247,10 @@ class _OrchestratedSandbox:
                 break
             try:
                 rec = json.loads(line)
+                # ``adopt`` takes only id/kind/path/source, so sandboxed code cannot set
+                # a parent-only field (``input_id``, ``content_type``, ``description``) --
+                # minting an input from inside the sandbox is impossible by signature, not
+                # by a denylist.
                 handle = self.store.adopt(id=rec["id"], kind=rec["kind"],
                                           path=rec["path"], source=rec.get("source", "run_python"))
                 ids.append(handle.id)
@@ -224,7 +258,7 @@ class _OrchestratedSandbox:
                 reused_count += 1
                 if len(reused) <= _MAX_REPORTED_IDS:  # stop tracking once past the display cap
                     reused[str(e.handle_id)[:_MAX_REPORTED_ID_LEN]] = None
-            except (json.JSONDecodeError, ValueError, KeyError, TypeError):
+            except (json.JSONDecodeError, ValueError, KeyError, TypeError, AttributeError):
                 continue
         parts = []
         if reused_count:
@@ -238,6 +272,64 @@ class _OrchestratedSandbox:
             parts.append(cap_error)
         return ids, "\n".join(parts) or None
 
+    def _process_publications(self, publish_file: Path | None,
+                              exit_code: int) -> tuple[list[dict], str | None]:
+        """Hand the child's publish requests to the publisher; return (records, error).
+
+        Runs only after the child has exited, and only on a clean exit, so published files are
+        complete. Every request is untrusted: the publisher re-validates the path from scratch.
+        The file is read up to ``_MAX_PUBLISH_CONTROL_BYTES`` and at most
+        ``_MAX_PUBLISH_REQUESTS`` requests are honored; malformed lines are skipped.
+        """
+        if publish_file is None or self.publisher is None:
+            return [], None
+        replaced = ("tether: publish control file was replaced by the script; publication "
+                    "requests ignored")
+        try:
+            # No-follow + non-blocking: a symlink or FIFO planted over the file must neither be
+            # followed nor hang the parent.
+            fd = os.open(publish_file, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        except FileNotFoundError:
+            return [], None
+        except OSError:
+            return [], replaced
+        with os.fdopen(fd, "rb") as f:
+            if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
+                return [], replaced
+            raw = f.read(_MAX_PUBLISH_CONTROL_BYTES + 1)
+        lines = [ln for ln in raw[:_MAX_PUBLISH_CONTROL_BYTES].decode(
+            "utf-8", errors="replace").splitlines() if ln.strip()]
+        if not lines:
+            return [], None
+        if exit_code != 0:
+            return [], (f"tether: {len(lines)} publication request(s) ignored because the "
+                        "script did not exit cleanly")
+        notes: list[str] = []
+        if len(raw) > _MAX_PUBLISH_CONTROL_BYTES:
+            notes.append("tether: publish control file truncated (too large)")
+        if len(lines) > _MAX_PUBLISH_REQUESTS:
+            notes.append(f"tether: too many publication requests (cap {_MAX_PUBLISH_REQUESTS}); "
+                         "later requests dropped")
+        records: list[dict] = []
+        for line in lines[:_MAX_PUBLISH_REQUESTS]:
+            try:
+                req = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(req, dict):
+                continue
+            path, name, desc = req.get("path"), req.get("name"), req.get("description")
+            if not isinstance(path, str):
+                records.append({"error": "invalid publication request (path must be a string)"})
+                continue
+            try:
+                records.append(self.publisher(
+                    path, name=name if isinstance(name, str) else None,
+                    description=desc if isinstance(desc, str) else None, source="run_python"))
+            except Exception as e:  # noqa: BLE001 - one bad request must not lose the run
+                records.append({"error": f"publication failed: {type(e).__name__}: {e}"})
+        return records, "\n".join(notes) or None
+
     def _launch(self, ctx: _RunContext) -> _LaunchResult:
         raise NotImplementedError
 
@@ -245,9 +337,10 @@ class _OrchestratedSandbox:
 class LocalSubprocessSandbox(_OrchestratedSandbox):
     """Runs the script in a scrubbed-env child process with rlimits + a wall-clock timeout.
 
-    **This tier provides no isolation**: the code runs as the host user, sharing the kernel,
-    the filesystem beyond the root, and the network. The rlimits and timeout bound resource
-    use, not privilege. Use the container backend for a real boundary.
+    **This tier is not a security boundary** and provides no isolation: the code runs as the
+    host user, sharing the kernel, the filesystem beyond the root, and the network. The
+    rlimits and timeout bound resource use, not privilege. Use the container backend for a
+    real boundary.
     """
 
     def _launch(self, ctx: _RunContext) -> _LaunchResult:
@@ -262,6 +355,8 @@ class LocalSubprocessSandbox(_OrchestratedSandbox):
             "TETHER_EMIT": str(ctx.emit_file),
             "PYTHONPATH": str(_RUNTIME_DIR),
         }
+        if ctx.publish_file is not None:
+            env["TETHER_PUBLISH"] = str(ctx.publish_file)
         try:
             proc = subprocess.run(
                 [sys.executable, str(_RUNNER), str(script_abs), *ctx.argv],

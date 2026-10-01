@@ -11,6 +11,7 @@ from ..session import Session
 # search` would get the *function* `search` (the package __init__ re-exports it, shadowing
 # the submodule of the same name) -- so always alias the functions, not the modules.
 from .code import run_python as _run_python
+from .deliver import publish_file as _publish_file, publish_handle as _publish_handle
 from .documents import read_document as _read_document
 from .fetch import fetch_url as _fetch_url
 from .files import list_files as _list_files, read_file as _read_file, write_file as _write_file
@@ -46,7 +47,8 @@ def build_tools(session: Session) -> list:
     def run_python(code: str | None = None, path: str | None = None,
                    args: list[str] | None = None) -> dict:
         """Run Python in the sandbox. Give `code` (inline) or `path` (a script file). Scripts
-        may use load(id)/save(id, obj)/emit(obj). Returns stdout/result/error/new_handles."""
+        may use load(id)/save(id, obj)/emit(obj), and publish(path) when file delivery is
+        enabled. Returns stdout/result/error/new_handles/published."""
         return _run_python(session, code, path, args)
 
     def inspect_handle(handle_id: str, rows: int = 20, stats: bool = False) -> dict:
@@ -67,5 +69,17 @@ def build_tools(session: Session) -> list:
         clean markdown handle with tables preserved; returns the handle summary."""
         return _read_document(session, source)
 
+    def publish_file(path: str, name: str | None = None,
+                     description: str | None = None) -> dict:
+        """Deliver a finished file in the workspace (e.g. under outputs/) to the user. Returns
+        its name/size/sha256 and the host's reply; publish only final files the user asked for."""
+        return _publish_file(session, path, name, description)
+
+    def publish_handle(handle_id: str, format: str | None = None, name: str | None = None,
+                       description: str | None = None) -> dict:
+        """Deliver a handle to the user as a file. Dataframes convert to `format`
+        ('csv' | 'xlsx' | 'parquet' | 'json', default csv); other handles are delivered as-is."""
+        return _publish_handle(session, handle_id, format, name, description)
+
     return [read_file, write_file, list_files, search, fetch_url, run_python, inspect_handle,
-            web_search, web_extract, read_document]
+            web_search, web_extract, read_document, publish_file, publish_handle]
