@@ -2000,10 +2000,12 @@ def test_local_backend_needs_no_runtime(tmp_path):
 Run: `uv run pytest tests/test_config.py -k default_backend tests/test_container_runtime.py -k "missing_runtime or needs_no_runtime" -v`
 Expected: FAIL — default is still `"local"`; `SandboxRuntimeUnavailable` does not exist
 
-- [ ] **Step 3: Create the suite-wide fixture first**
+- [ ] **Step 3: Add the suite-wide backend fixture**
 
-This must land before the default flips, or 248 tests start demanding a container runtime.
-Create `tests/conftest.py`:
+This must land before the default flips, or the whole suite starts demanding a container
+runtime. **`tests/conftest.py` already exists** — Task 7 created it to stub DNS resolution
+after wiring the egress guard made the suite non-hermetic. ADD this fixture alongside the
+existing one; do not overwrite the file.
 
 ```python
 """Suite-wide defaults.
