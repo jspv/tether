@@ -10,7 +10,9 @@ from typing import Any, Callable
 from . import bundles as _bundles
 from .config import TetherConfig, SandboxConfig
 from .handles import HandleStore
-from .sandbox import ControlPlaneLimits, LocalSubprocessSandbox, SandboxExecutor
+from .sandbox import (
+    ControlPlaneLimits, LocalSubprocessSandbox, SandboxExecutor, SandboxRuntimeUnavailable,
+)
 from .status import StatusBus, StatusEvent, bind_bus
 
 
@@ -171,8 +173,28 @@ def _resolve_root(config: TetherConfig) -> Path:
 
 def _build_sandbox(root: Path, store: HandleStore, sandbox_config: SandboxConfig,
                    limits: ControlPlaneLimits | None = None) -> SandboxExecutor:
-    """Pick the sandbox backend from config (default: local)."""
+    """Pick the sandbox backend from config (default: container).
+
+    A missing container runtime is a hard error, never a fallback: silently dropping to the
+    local tier would hand back a no-isolation sandbox while the caller believes the code is
+    contained. The opt-out has to be explicit.
+    """
     if sandbox_config.backend == "container":
+        from . import container_runtime
         from .sandbox_container import ContainerSandbox  # local import: optional backend
-        return ContainerSandbox(root=root, store=store, config=sandbox_config, limits=limits)
+        try:
+            # Probe LIVENESS, not mere presence. `detect_runtime` only checks shutil.which,
+            # so a machine with podman installed but its VM not started passes detection and
+            # then fails much later with an opaque "failed to build sandbox image" error.
+            # That is the most common failure mode -- especially on macOS, where the runtime
+            # lives in a Linux VM -- and it is exactly the case this message exists to serve.
+            container_runtime.require_usable_runtime(sandbox_config.container_runtime)
+            return ContainerSandbox(root=root, store=store, config=sandbox_config,
+                                    limits=limits)
+        except RuntimeError as e:
+            raise SandboxRuntimeUnavailable(
+                f"{e}\nThe container backend is the default because run_python executes "
+                f'model-authored code. Install podman or docker, or set '
+                f'TetherConfig.sandbox.backend = "local" to run it with no isolation.'
+            ) from e
     return LocalSubprocessSandbox(root=root, store=store, config=sandbox_config, limits=limits)

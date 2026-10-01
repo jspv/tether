@@ -4,7 +4,7 @@ from .api import Tether, Result, ToolFactory, solve, tool_factory
 from .config import FetchConfig, TetherConfig, SandboxConfig
 from .handles import Handle, HandleStore
 from .paths import PathEscapesRootError, safe_path
-from .sandbox import ExecResult, LocalSubprocessSandbox, SandboxExecutor
+from .sandbox import ExecResult, LocalSubprocessSandbox, SandboxExecutor, SandboxRuntimeUnavailable
 from .sandbox_container import ContainerSandbox
 from .session import Session
 from .conversation import Conversation
@@ -19,7 +19,7 @@ __all__ = [
     "FetchConfig", "TetherConfig", "SandboxConfig",
     "Handle", "HandleStore",
     "PathEscapesRootError", "safe_path",
-    "ExecResult", "LocalSubprocessSandbox", "SandboxExecutor",
+    "ExecResult", "LocalSubprocessSandbox", "SandboxExecutor", "SandboxRuntimeUnavailable",
     "ContainerSandbox",
     "Session",
     "Conversation", "SessionManager",

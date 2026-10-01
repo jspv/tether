@@ -29,6 +29,10 @@ _MAX_REPORTED_IDS = 5   # distinct rejected ids named in an error message
 _MAX_REPORTED_ID_LEN = 64
 
 
+class SandboxRuntimeUnavailable(RuntimeError):
+    """Raised when the container backend is selected but no container runtime exists."""
+
+
 @dataclass
 class ExecResult:
     stdout: str
@@ -214,7 +218,12 @@ class _OrchestratedSandbox:
 
 
 class LocalSubprocessSandbox(_OrchestratedSandbox):
-    """Runs the script in a scrubbed-env child process with rlimits + a wall-clock timeout."""
+    """Runs the script in a scrubbed-env child process with rlimits + a wall-clock timeout.
+
+    **This tier provides no isolation**: the code runs as the host user, sharing the kernel,
+    the filesystem beyond the root, and the network. The rlimits and timeout bound resource
+    use, not privilege. Use the container backend for a real boundary.
+    """
 
     def _launch(self, ctx: _RunContext) -> _LaunchResult:
         script_abs = ctx.root / ctx.script_rel

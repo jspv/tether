@@ -17,7 +17,6 @@ def test_defaults_are_sensible():
 
 def test_sandbox_backend_defaults_and_container_fields():
     cfg = TetherConfig()
-    assert cfg.sandbox.backend == "local"            # default backend
     assert cfg.sandbox.network is False              # network off by default
     assert cfg.sandbox.pip_packages == ()
     assert cfg.sandbox.container_runtime is None      # auto-detect
@@ -36,3 +35,21 @@ def test_control_plane_caps_have_defaults():
     assert cfg.max_emit_bytes == 1024 * 1024
     assert cfg.max_control_bytes == 8 * 1024 * 1024
     assert cfg.max_new_handles == 256
+
+
+def test_container_is_the_default_backend(monkeypatch):
+    """Real isolation by default.
+
+    The suite's autouse fixture pins ``local`` via TETHER_SANDBOX_BACKEND, which would
+    otherwise hide a regression in the shipped default -- so this test deletes the
+    variable and asserts what a user actually gets.
+    """
+    monkeypatch.delenv("TETHER_SANDBOX_BACKEND", raising=False)
+    assert SandboxConfig().backend == "container"
+    assert TetherConfig().sandbox.backend == "container"
+
+
+def test_sandbox_backend_env_override(monkeypatch):
+    monkeypatch.setenv("TETHER_SANDBOX_BACKEND", "local")
+    assert SandboxConfig().backend == "local"
+    assert SandboxConfig(backend="container").backend == "container"   # explicit arg wins

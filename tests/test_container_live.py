@@ -5,12 +5,25 @@ from pathlib import Path
 import pytest
 
 from tether.config import SandboxConfig
+from tether.container_runtime import require_usable_runtime
 from tether.handles import HandleStore
 from tether.sandbox import LocalSubprocessSandbox
 from tether.sandbox_container import ContainerSandbox
 
-_RUNTIME = "podman" if shutil.which("podman") else ("docker" if shutil.which("docker") else None)
-pytestmark = pytest.mark.skipif(_RUNTIME is None, reason="no podman/docker runtime available")
+
+
+def _probe_runtime() -> tuple[str | None, str]:
+    # Liveness, not presence: podman can be on PATH with its VM stopped, in which case these
+    # tests would run and fail rather than skip.
+    try:
+        return require_usable_runtime(None), ""
+    except RuntimeError as e:
+        return None, str(e)
+
+
+_RUNTIME, _SKIP_REASON = _probe_runtime()
+pytestmark = pytest.mark.skipif(
+    _RUNTIME is None, reason=f"no usable container runtime: {_SKIP_REASON}")
 
 
 @pytest.fixture

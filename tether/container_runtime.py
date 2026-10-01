@@ -33,6 +33,28 @@ def detect_runtime(override: str | None, which: Callable[[str], str | None] = sh
     )
 
 
+def require_usable_runtime(override: str | None, run: Callable = subprocess.run) -> str:
+    """Return a runtime that is actually usable, else raise RuntimeError.
+
+    ``detect_runtime`` only checks PATH. A machine with podman installed but its VM not
+    started passes that check and then fails at first use with an opaque image-build error.
+    Probing once per session is cheap next to building or running a container.
+    """
+    runtime = detect_runtime(override)
+    try:
+        proc = run([runtime, "info"], capture_output=True, timeout=30)
+    except (OSError, subprocess.SubprocessError) as e:
+        raise RuntimeError(f"container runtime {runtime!r} is installed but not usable: {e}") from e
+    if proc.returncode != 0:
+        detail = (proc.stderr or b"").decode(errors="replace").strip().splitlines()
+        hint = detail[0] if detail else f"exit {proc.returncode}"
+        raise RuntimeError(
+            f"container runtime {runtime!r} is installed but not responding ({hint}). "
+            f"On macOS this usually means the VM is not started -- try `{runtime} machine start`."
+        )
+    return runtime
+
+
 def _py_tag() -> str:
     return f"py{sys.version_info.major}{sys.version_info.minor}"
 

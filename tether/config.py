@@ -2,9 +2,21 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
+
+
+def _default_sandbox_backend() -> str:
+    """Shipped default: the container tier, i.e. real isolation.
+
+    ``TETHER_SANDBOX_BACKEND`` overrides it. Setting it to ``local`` opts out of isolation
+    entirely, so it is only for environments that have made that choice deliberately --
+    CI and the test suite, which must run without a container runtime. An explicit
+    ``SandboxConfig(backend=...)`` argument still wins over the variable.
+    """
+    return os.environ.get("TETHER_SANDBOX_BACKEND", "container")
 
 
 @dataclass
@@ -12,7 +24,7 @@ class SandboxConfig:
     timeout_s: float = 30.0
     max_memory_mb: int = 1024
     max_file_size_mb: int = 512        # enforced by the local tier only (no container equivalent)
-    backend: Literal["local", "container"] = "local"
+    backend: Literal["local", "container"] = field(default_factory=_default_sandbox_backend)
     container_runtime: str | None = None   # None -> auto-detect podman, then docker
     network: bool = False                  # sandbox network off by default; opt-in to enable
     pip_packages: tuple[str, ...] = ()     # provisioned into a mounted layer (network only there)

@@ -105,3 +105,106 @@ def test_ensure_layer_reprovisions_if_sentinel_missing(tmp_path):
 
     ensure_layer("podman", cfg, base=tmp_path, run=lambda a, **k: calls.append(a) or _Proc())
     assert any("pip" in a for a in calls)               # re-provisioned despite non-empty dir
+
+
+# --- default backend guard / liveness probe -------------------------------------------
+
+import subprocess  # noqa: E402
+from types import SimpleNamespace  # noqa: E402
+
+from tether.container_runtime import require_usable_runtime  # noqa: E402
+from tether.handles import HandleStore  # noqa: E402
+from tether.sandbox import SandboxRuntimeUnavailable  # noqa: E402
+from tether.session import _build_sandbox  # noqa: E402
+
+
+def test_missing_runtime_raises_and_names_the_opt_out(tmp_path, monkeypatch):
+    def no_runtime(override, which=None):
+        raise RuntimeError("no container runtime found (looked for podman, docker)")
+
+    # ContainerSandbox.__init__ does `from .container_runtime import detect_runtime` at call
+    # time, so patching the module attribute is what takes effect.
+    monkeypatch.setattr("tether.container_runtime.detect_runtime", no_runtime)
+    store = HandleStore(tmp_path / "r")
+
+    with pytest.raises(SandboxRuntimeUnavailable) as excinfo:
+        _build_sandbox(tmp_path / "r", store, SandboxConfig(backend="container"))
+
+    message = str(excinfo.value)
+    assert 'backend = "local"' in message       # tells the user exactly how to proceed
+    assert "no isolation" in message
+
+
+def test_local_backend_needs_no_runtime(tmp_path):
+    store = HandleStore(tmp_path / "r")
+    sandbox = _build_sandbox(tmp_path / "r", store, SandboxConfig(backend="local"))
+    assert type(sandbox).__name__ == "LocalSubprocessSandbox"
+
+
+def _present(monkeypatch, name="podman"):
+    monkeypatch.setattr("tether.container_runtime.detect_runtime",
+                        lambda override, which=None: name)
+
+
+def test_usable_runtime_returned_on_zero_exit(monkeypatch):
+    _present(monkeypatch)
+    calls = []
+
+    def run(cmd, **kw):
+        calls.append(cmd)
+        return SimpleNamespace(returncode=0, stderr=b"")
+
+    assert require_usable_runtime(None, run=run) == "podman"
+    assert calls == [["podman", "info"]]
+
+
+def test_installed_but_not_responding_raises_with_stderr_hint(monkeypatch):
+    _present(monkeypatch)
+
+    def run(cmd, **kw):
+        return SimpleNamespace(returncode=125, stderr=b"Cannot connect to Podman\nmore\n")
+
+    with pytest.raises(RuntimeError) as excinfo:
+        require_usable_runtime(None, run=run)
+    assert "Cannot connect to Podman" in str(excinfo.value)
+    assert "podman machine start" in str(excinfo.value)
+
+
+def test_probe_oserror_raises(monkeypatch):
+    _present(monkeypatch)
+
+    def run(cmd, **kw):
+        raise OSError("exec format error")
+
+    with pytest.raises(RuntimeError, match="not usable"):
+        require_usable_runtime(None, run=run)
+
+
+def test_probe_timeout_raises(monkeypatch):
+    _present(monkeypatch)
+
+    def run(cmd, **kw):
+        raise subprocess.TimeoutExpired(cmd, 30)
+
+    with pytest.raises(RuntimeError, match="not usable"):
+        require_usable_runtime(None, run=run)
+
+
+def test_build_sandbox_surfaces_dead_runtime_as_unavailable(tmp_path, monkeypatch):
+    """Installed-but-not-started: detection passes, the probe fails, the user is told how out."""
+    monkeypatch.setattr("tether.container_runtime.detect_runtime",
+                        lambda override, which=None: "podman")
+    # `run=subprocess.run` is bound at def time, so patching subprocess.run would be a no-op;
+    # wrap the real probe with a fake runner instead.
+    real = require_usable_runtime
+    monkeypatch.setattr(
+        "tether.container_runtime.require_usable_runtime",
+        lambda override: real(override, run=lambda cmd, **kw: SimpleNamespace(
+            returncode=125, stderr=b"Cannot connect to Podman")),
+    )
+    store = HandleStore(tmp_path / "r")
+
+    with pytest.raises(SandboxRuntimeUnavailable) as excinfo:
+        _build_sandbox(tmp_path / "r", store, SandboxConfig(backend="container"))
+    assert "Cannot connect to Podman" in str(excinfo.value)
+    assert 'backend = "local"' in str(excinfo.value)

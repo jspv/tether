@@ -18,3 +18,21 @@ def _no_real_dns(monkeypatch):
         return ["93.184.216.34"]
 
     monkeypatch.setattr("tether.egress._resolve", _stub)
+
+
+@pytest.fixture(autouse=True)
+def _disabled_local_sandbox(monkeypatch):
+    """Pin the sandbox backend to ``local`` for every test.
+
+    The shipped default is ``container`` (real isolation). The suite must stay offline,
+    fast, and runnable without podman or docker, so every test gets ``local`` unless it
+    asks otherwise. Tests of the container tier build their own SandboxConfig and are
+    gated on a usable runtime.
+
+    This pins the backend through the environment variable the field's default_factory
+    reads. Do NOT use ``monkeypatch.setattr(SandboxConfig, "backend", "local")`` -- that is
+    a silent no-op, because a dataclass bakes its defaults into ``__init__.__defaults__``
+    at class-creation time. ``test_config.py`` asserts the *shipped* default and therefore
+    deletes the variable rather than relying on this fixture.
+    """
+    monkeypatch.setenv("TETHER_SANDBOX_BACKEND", "local")

@@ -11,7 +11,7 @@ import sys
 import traceback
 from pathlib import Path
 
-from tether import Tether, TetherConfig
+from tether import SandboxConfig, Tether, TetherConfig
 
 RESULTS = Path(__file__).resolve().parent / "results"
 RUNS = Path(__file__).resolve().parent / "runs"
@@ -86,7 +86,9 @@ TASKS = [
 
 def run_task(task: dict) -> dict:
     RUNS.mkdir(parents=True, exist_ok=True)
-    cfg = TetherConfig(root_dir=RUNS / task["id"], model=MODEL)
+    # Evals measure model behavior and should not require a container runtime.
+    cfg = TetherConfig(root_dir=RUNS / task["id"], model=MODEL,
+                       sandbox=SandboxConfig(backend="local"))
     h = Tether(cfg)
     if task.get("seed"):
         task["seed"](h.session)
