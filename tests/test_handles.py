@@ -139,3 +139,67 @@ def test_rehydrate_skips_corrupt_record(tmp_path):
     mf.write_text(json.dumps(data))
     s2 = HandleStore(tmp_path)                         # must not raise
     assert "h1" in s2.manifest() and "bad" not in s2.manifest()
+
+
+def test_describe_dataframe_matches_put(tmp_path):
+    """A described file and a put() handle agree exactly — the parity property that
+    replaces the hand-maintained duplication in runtime/tether_sandbox.py."""
+    store = HandleStore(tmp_path / "r")
+    df = pd.DataFrame({"i": range(10), "s": ["a"] * 10, "f": [1.5] * 10})
+    handle = store.put(df, source="t")
+
+    described = store._describe_dataframe(store.root / handle.path)
+
+    assert described["schema"] == handle.schema
+    assert described["preview"] == handle.preview
+    assert described["n_rows"] == handle.n_rows == 10
+    assert described["n_cols"] == handle.n_cols == 3
+    assert described["bytes"] == handle.bytes
+
+
+def test_describe_dataframe_reads_only_first_row_group(tmp_path):
+    """A 500MB handle must not be materialized to describe it: schema and row count come
+    from the footer, the preview from row group 0 only."""
+    import pyarrow.parquet as pq
+
+    store = HandleStore(tmp_path / "r")
+    path = store.root / "handles" / "big.parquet"
+    pd.DataFrame({"n": range(1000)}).to_parquet(path, row_group_size=100)
+
+    read_groups = []
+    real_read_row_group = pq.ParquetFile.read_row_group
+
+    def spy(self, i, *a, **kw):
+        read_groups.append(i)
+        return real_read_row_group(self, i, *a, **kw)
+
+    pq.ParquetFile.read_row_group = spy
+    try:
+        described = store._describe_dataframe(path)
+    finally:
+        pq.ParquetFile.read_row_group = real_read_row_group
+
+    assert read_groups == [0]                      # never touched groups 1..9
+    assert described["n_rows"] == 1000
+    assert described["preview"].startswith("n\n0\n1\n2\n3\n4\n")
+    assert "... (5 of 1000 rows)" in described["preview"]
+
+
+def test_describe_dataframe_empty_frame(tmp_path):
+    store = HandleStore(tmp_path / "r")
+    df = pd.DataFrame({"a": pd.Series([], dtype="int64")})
+    handle = store.put(df, source="t")
+    described = store._describe_dataframe(store.root / handle.path)
+    assert described["n_rows"] == 0
+    assert described["preview"] == handle.preview
+
+
+def test_describe_text_and_json_bound_the_preview(tmp_path):
+    store = HandleStore(tmp_path / "r")
+    text_path = store.root / "handles" / "x.txt"
+    text_path.write_text("z" * 10_000, encoding="utf-8")
+    assert len(store._describe_text(text_path)["preview"]) == 800
+
+    json_path = store.root / "handles" / "x.json"
+    json_path.write_text('["' + "z" * 10_000 + '"]', encoding="utf-8")
+    assert len(store._describe_json(json_path)["preview"]) == 800

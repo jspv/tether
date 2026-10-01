@@ -83,45 +83,74 @@ class HandleStore:
         # Store raw bytes intact so the file (xls/pdf/image/...) stays readable by pandas,
         # Docling, etc. The extension is preserved so libraries can infer the format.
         rel = f"handles/{hid}{ext or '.bin'}"
-        (self.root / rel).write_bytes(bytes(data))
-        return Handle(
-            id=hid, kind="binary", path=rel, source=source,
-            bytes=len(data), preview=f"<binary file, {len(data)} bytes, {ext or '.bin'}>",
-        )
+        path = self.root / rel
+        path.write_bytes(bytes(data))
+        return Handle(id=hid, kind="binary", path=rel, source=source,
+                      **self._describe_binary(path))
 
     def _write_dataframe(self, hid: str, df: Any, source: str) -> Handle:
         rel = f"handles/{hid}.parquet"
         path = self.root / rel
         df.to_parquet(path)
-        preview = df.head(_PREVIEW_ROWS).to_csv(index=False)
-        preview += f"... ({_PREVIEW_ROWS} of {len(df)} rows)" if len(df) > _PREVIEW_ROWS else ""
-        return Handle(
-            id=hid, kind="dataframe", path=rel, source=source,
-            bytes=path.stat().st_size, preview=preview,
-            schema={c: str(t) for c, t in df.dtypes.items()},
-            n_rows=int(len(df)), n_cols=int(df.shape[1]),
-        )
+        return Handle(id=hid, kind="dataframe", path=rel, source=source,
+                      **self._describe_dataframe(path))
 
     def _write_json(self, hid: str, obj: Any, source: str) -> Handle:
         # ``default=str`` keeps non-JSON-native types (datetime, Decimal, ...) from
         # crashing serialization, but they round-trip back as strings via get().
         rel = f"handles/{hid}.json"
         path = self.root / rel
-        text = json.dumps(obj, default=str)
-        path.write_text(text, encoding="utf-8")
-        return Handle(
-            id=hid, kind="json", path=rel, source=source,
-            bytes=len(text.encode()), preview=text[:_PREVIEW_CHARS],
-        )
+        path.write_text(json.dumps(obj, default=str), encoding="utf-8")
+        return Handle(id=hid, kind="json", path=rel, source=source,
+                      **self._describe_json(path))
 
     def _write_text(self, hid: str, obj: str, source: str) -> Handle:
         rel = f"handles/{hid}.txt"
         path = self.root / rel
         path.write_text(obj, encoding="utf-8")
-        return Handle(
-            id=hid, kind="text", path=rel, source=source,
-            bytes=len(obj.encode()), preview=obj[:_PREVIEW_CHARS],
-        )
+        return Handle(id=hid, kind="text", path=rel, source=source,
+                      **self._describe_text(path))
+
+    def _describe_dataframe(self, path: Path) -> dict[str, Any]:
+        """Describe a parquet file without materializing it.
+
+        Schema and row count come from the footer; the preview reads only the first row
+        group. Row groups are ordered, so row group 0 holds the first ``_PREVIEW_ROWS``
+        rows. ``schema_arrow.empty_table().to_pandas()`` yields the pandas dtypes the
+        equivalent ``put()`` would report, without reading any data.
+        """
+        import pyarrow.parquet as pq
+
+        pf = pq.ParquetFile(path)
+        n_rows = int(pf.metadata.num_rows)
+        schema_df = pf.schema_arrow.empty_table().to_pandas()
+        if pf.num_row_groups:
+            head = pf.read_row_group(0).slice(0, _PREVIEW_ROWS).to_pandas()
+            preview = head.to_csv(index=False)
+        else:
+            preview = ""
+        if n_rows > _PREVIEW_ROWS:
+            preview += f"... ({_PREVIEW_ROWS} of {n_rows} rows)"
+        return {
+            "bytes": path.stat().st_size,
+            "preview": preview,
+            "schema": {c: str(t) for c, t in schema_df.dtypes.items()},
+            "n_rows": n_rows,
+            "n_cols": int(len(schema_df.columns)),
+        }
+
+    def _describe_json(self, path: Path) -> dict[str, Any]:
+        text = path.read_text(encoding="utf-8")
+        return {"bytes": len(text.encode()), "preview": text[:_PREVIEW_CHARS]}
+
+    def _describe_text(self, path: Path) -> dict[str, Any]:
+        text = path.read_text(encoding="utf-8")
+        return {"bytes": len(text.encode()), "preview": text[:_PREVIEW_CHARS]}
+
+    def _describe_binary(self, path: Path) -> dict[str, Any]:
+        size = path.stat().st_size
+        ext = path.suffix or ".bin"
+        return {"bytes": size, "preview": f"<binary file, {size} bytes, {ext}>"}
 
     def _advance_counter(self, hid: str) -> None:
         """Keep the auto-id counter ahead of an externally-supplied ``h<N>`` id."""
