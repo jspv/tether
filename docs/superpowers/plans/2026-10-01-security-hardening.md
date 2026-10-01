@@ -28,7 +28,12 @@ flips to `container` with a loud failure when no runtime exists.
   harness", "references-not-payloads"). Verify with the command in the checklist below.
 - Python **3.12+**. Dependencies are already declared; this plan adds **no new dependency**
   (`pyarrow`, `httpx`, `pandas` are all existing).
-- Run tests with `uv run pytest`; lint with `uv run ruff check .`. The suite must stay
+- Run tests with `uv run pytest`; lint with `uv run ruff check tether tests`. **The repo is
+  not lint-clean and was not before this phase**: 8 errors (E402 in `test_sandbox.py` and
+  `test_web.py`, plus unused imports) are present at `main` (32ebcf35) — verified. The bar is
+  therefore **introduce no new lint errors**, not "ruff is clean". Do not fix the pre-existing
+  8; that is unrelated refactoring. Note bare `ruff check .` also scans `.claude/worktrees`
+  and reports 18 — scope it to `tether tests`. The suite must stay
   **offline** — no network, no model, no container runtime required. Baseline before starting:
   **242 passed, 6 skipped** (248 collected). Report passed/skipped separately; the
   often-quoted "248" is the collected total, not the pass count.
