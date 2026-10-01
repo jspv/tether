@@ -634,7 +634,9 @@ git commit -m "feat(sandbox): adopt child handles with parent-derived metadata"
 
 **Files:**
 - Modify: `tether/config.py` (three new `TetherConfig` fields)
-- Modify: `tether/sandbox.py` (emit size check; new-handles read + record caps)
+- Modify: `tether/sandbox.py` (emit size check; caps; surface id-reuse rejections)
+- Modify: `tether/runtime/tether_sandbox.py` (child-side early error on id reuse)
+- Modify: `tether/sandbox_container.py` (`ContainerSandbox.__init__` forwards `limits`)
 - Test: `tests/test_sandbox.py`, `tests/test_config.py`
 
 **Interfaces:**
@@ -646,6 +648,83 @@ git commit -m "feat(sandbox): adopt child handles with parent-derived metadata"
 Note: `_OrchestratedSandbox` currently receives only `SandboxConfig`, but these caps live on
 `TetherConfig` by design (they bound the parent↔child channel, not a backend). `Session`
 builds the sandbox, so pass them explicitly rather than reaching for a global.
+
+### Carried from Task 3 (load-bearing — fix as part of this task)
+
+Task 3's review found that re-saving an existing handle id is now **silently dropped**,
+leaving the store's metadata describing bytes that are no longer on disk. Reproduced:
+`save('h1', three_row_df)` then `save('h1', nine_thousand_row_df)` leaves the store reporting
+3 rows while `handles/h1.parquet` holds 9999 — and the child gets its id back with no
+exception, so it believes it succeeded. `ExecResult.error` is `None` throughout.
+
+Handles being immutable is correct and stays. The defect is that the *record* is immutable
+while the *file* is not, so the phase has introduced exactly the metadata/bytes divergence it
+exists to prevent. Both halves below are required.
+
+**(a) Child-side ergonomics.** `save()` in `tether/runtime/tether_sandbox.py` already receives
+the existing-handle registry as `TETHER_REGISTRY` (loaded into `_REGISTRY` at import). Before
+writing, refuse an id that is already registered:
+
+```python
+    if handle_id in _REGISTRY:
+        raise ValueError(
+            f"handle id {handle_id!r} already exists and handles are immutable; "
+            f"save under a new id"
+        )
+```
+
+This makes honest code fail at the point of the mistake instead of silently succeeding. It is
+deliberately **not** a security control — an adversarial child can skip `save()` and write the
+control file directly. That is fine; (b) is the boundary.
+
+**(b) Parent-side authority.** An id-reuse rejection must be *reported*, never dropped. In
+`_ingest_new_handles`, distinguish an id-reuse `ValueError` from the other rejections and fold
+it into the returned error string so it reaches `ExecResult.error` and the model learns the
+save did not take effect. Keep the tolerant-skip behavior: ingestion continues.
+
+Tests required for both (note these use the `_tiny_limits_sandbox`/`_sandbox` helpers defined
+elsewhere in this task):
+
+```python
+def test_resaving_an_existing_id_raises_in_the_child(tmp_path):
+    # Honest code must fail loudly at the point of the mistake, not believe it succeeded.
+    sb, store = _sandbox(tmp_path)
+    sb.run_code("from tether_sandbox import save\nsave('h1', {'v': 1})\n")
+    res = sb.run_code("from tether_sandbox import save\nsave('h1', {'v': 2})\n")
+    assert res.exit_code != 0
+    assert "already exists" in (res.error or "")
+
+
+def test_id_reuse_rejection_is_reported_not_silent(tmp_path):
+    # The parent is the boundary: a hand-written control record reusing an id is refused
+    # AND surfaced, so stale metadata can never sit silently over changed bytes.
+    sb, store = _sandbox(tmp_path)
+    original = store.put({"trusted": True}, source="parent")
+    res = sb.run_code(
+        "import json, os\n"
+        "open(os.path.join('handles', 'evil.txt'), 'w').write('attacker data')\n"
+        f"rec = {{'id': {original.id!r}, 'kind': 'text', 'path': 'handles/evil.txt',\n"
+        "       'source': 'run_python'}\n"
+        "open(os.environ['TETHER_NEW_HANDLES'], 'a').write(json.dumps(rec) + '\\n')\n")
+    assert res.new_handles == []
+    assert "already exists" in (res.error or "")
+    assert store.summary(original.id) == original.summary()
+```
+
+### Also carried from Task 3 — three test-quality fixes in `tests/test_sandbox.py`
+
+- `test_child_record_carries_no_metadata` currently passes even with the protection removed
+  (the old child computed the same `n_rows`/`schema`), so it does not earn its name. Make it
+  assert the **record's key set** is exactly `{"id", "kind", "path", "source"}` — read the
+  new-handles file before ingestion, or monkeypatch `store.adopt` to capture its kwargs.
+- `test_one_corrupt_record_does_not_abort_ingestion` is missing the `assert res.error is None`
+  its siblings carry. Add it.
+- `test_dataframe_preview_matches_between_parent_and_child` (pre-existing) is now moot: the
+  child produces no preview, so it compares parent-derived values with parent-derived values.
+  Delete it and say so in the report — the parity property it meant to guard is now covered by
+  `test_adopt_and_put_produce_identical_summaries`.
+
+---
 
 - [ ] **Step 1: Write the failing tests**
 
