@@ -42,3 +42,10 @@ def test_tether_instructions_compose_by_bundle(tmp_path):
     # web fragment only appears when web is selected
     assert "web_search" not in sess.tether_instructions("code")
     assert "web_search" in sess.tether_instructions("web")
+
+
+def test_public_exports_for_host_integration():
+    import tether
+    for name in ("PublishedFile", "OnPublish", "PublishError", "sandbox_preflight",
+                 "PreflightReport", "SandboxRuntimeUnavailable"):
+        assert hasattr(tether, name) and name in tether.__all__

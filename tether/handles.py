@@ -16,7 +16,7 @@ _PREVIEW_ROWS = 5
 @dataclass
 class Handle:
     id: str
-    kind: str  # "json" | "text" | "dataframe"
+    kind: str  # "json" | "text" | "dataframe" | "binary"
     path: str  # POSIX path relative to the session root
     source: str
     bytes: int
@@ -24,6 +24,9 @@ class Handle:
     schema: dict[str, str] | None = None
     n_rows: int | None = None
     n_cols: int | None = None
+    input_id: str | None = None       # host-supplied id of an uploaded input
+    content_type: str | None = None   # advisory type of an uploaded input
+    description: str | None = None    # host-supplied description of an uploaded input
 
     def summary(self) -> dict[str, Any]:
         """Context-facing view: drop None fields to keep it compact."""
@@ -151,6 +154,31 @@ class HandleStore:
         handle = self._register_record(record)
         self._save_manifest()
         return handle
+
+    def put_input(self, *, path: str, size: int, preview: str, source: str, input_id: str,
+                  content_type: str | None = None, description: str | None = None) -> Handle:
+        """Register a host-ingested upload whose file already exists under ``inputs/``.
+
+        Parent-authored (the host wrote the bytes), so it does not go through the sandbox
+        adoption path. Idempotent by ``input_id``: an existing input is returned unchanged.
+        """
+        existing = self.inputs().get(input_id)
+        if existing is not None:
+            return existing
+        try:
+            safe_path(self.root, path)
+        except PathEscapesRootError as e:
+            raise ValueError(f"input path escapes root: {path!r}") from e
+        handle = Handle(id=self._new_id(), kind="binary", path=path, source=source, bytes=size,
+                        preview=preview, input_id=input_id, content_type=content_type,
+                        description=description)
+        self._handles[handle.id] = handle
+        self._save_manifest()
+        return handle
+
+    def inputs(self) -> dict[str, Handle]:
+        """Uploaded inputs, keyed by host-supplied ``input_id``."""
+        return {h.input_id: h for h in self._handles.values() if h.input_id is not None}
 
     @property
     def _manifest_file(self) -> Path:

@@ -10,6 +10,7 @@ root filesystem, dropped capabilities, and memory/cpu/pid limits.
 from __future__ import annotations
 
 import os
+import secrets
 import subprocess
 from pathlib import Path
 
@@ -17,6 +18,7 @@ from .config import SandboxConfig
 from .sandbox import _RUNTIME_DIR, _LaunchResult, _OrchestratedSandbox, _RunContext, _as_text
 
 _PIDS_LIMIT = 256
+_RM_TIMEOUT_S = 30.0
 
 
 class ContainerSandbox(_OrchestratedSandbox):
@@ -29,10 +31,13 @@ class ContainerSandbox(_OrchestratedSandbox):
             from .container_runtime import detect_runtime
             self._runtime = detect_runtime(self.config.container_runtime)
 
-    def _build_run_argv(self, ctx: _RunContext, tag: str, layer: Path | None) -> list[str]:
+    def _build_run_argv(self, ctx: _RunContext, tag: str, layer: Path | None,
+                        name: str | None = None) -> list[str]:
         cfg = self.config
-        argv = [
-            self._runtime, "run", "--rm",
+        argv = [self._runtime, "run", "--rm"]
+        if name is not None:
+            argv += ["--name", name]
+        argv += [
             "--read-only", "--tmpfs", "/tmp:rw,nosuid,nodev",
             "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
             "--pids-limit", str(_PIDS_LIMIT),
@@ -51,6 +56,12 @@ class ContainerSandbox(_OrchestratedSandbox):
             "-v", f"{_RUNTIME_DIR}:/runtime:ro",
             "-w", "/workspace",
         ]
+        inputs = ctx.root / "inputs"
+        # Uploaded inputs are read-only to sandboxed code: overlay them :ro on the rw workspace.
+        # Only a real directory is mounted -- a symlink planted by an earlier run would make the
+        # runtime bind-mount whatever host path it points at.
+        if inputs.is_dir() and not inputs.is_symlink():
+            argv += ["-v", f"{inputs}:/workspace/inputs:ro"]
         if not cfg.network:
             argv += ["--network", "none"]
         pythonpath = "/runtime"
@@ -67,6 +78,8 @@ class ContainerSandbox(_OrchestratedSandbox):
             "TMPDIR": "/tmp",
             "PATH": "/usr/local/bin:/usr/bin:/bin",
         }
+        if ctx.publish_file is not None:
+            env["TETHER_PUBLISH"] = f"/workspace/{ctx.publish_file.name}"
         for key, value in env.items():
             argv += ["-e", f"{key}={value}"]
         argv += [tag, "python", "/runtime/_runner.py", ctx.script_rel, *ctx.argv]
@@ -78,7 +91,8 @@ class ContainerSandbox(_OrchestratedSandbox):
         tag = image_tag(self.config.preinstalled)
         ensure_image(self._runtime, tag, self.config)
         layer = ensure_layer(self._runtime, self.config) if self.config.pip_packages else None
-        argv = self._build_run_argv(ctx, tag, layer)
+        name = f"tether-{secrets.token_hex(8)}"
+        argv = self._build_run_argv(ctx, tag, layer, name=name)
         try:
             proc = subprocess.run(argv, capture_output=True, text=True,
                                   timeout=ctx.config.timeout_s)
@@ -86,6 +100,21 @@ class ContainerSandbox(_OrchestratedSandbox):
             killed_by = "killed" if proc.returncode == 137 else None
             return _LaunchResult(proc.stdout, proc.stderr, proc.returncode, killed_by=killed_by)
         except subprocess.TimeoutExpired as e:
+            # Killing the runtime CLI does not stop the container: remove it by name, or it would
+            # keep running in the bind-mounted root after this run (and the run lock) is over.
+            note = self._remove_container(name)
             return _LaunchResult(_as_text(e.stdout),
-                                 _as_text(e.stderr) + "\ntether: killed (timeout)",
+                                 _as_text(e.stderr) + "\ntether: killed (timeout)" + note,
                                  -1, killed_by="timeout")
+
+    def _remove_container(self, name: str) -> str:
+        """Force-remove a container by name; returns a warning suffix if that failed."""
+        try:
+            proc = subprocess.run([self._runtime, "rm", "-f", name], capture_output=True,
+                                  text=True, timeout=_RM_TIMEOUT_S)
+        except (subprocess.TimeoutExpired, OSError) as e:
+            return f"\ntether: WARNING: could not remove timed-out container {name}: {e}"
+        if proc.returncode != 0:
+            return (f"\ntether: WARNING: could not remove timed-out container {name}: "
+                    f"{proc.stderr.strip()}")
+        return ""

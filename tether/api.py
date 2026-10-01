@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, AsyncIterator, Callable
 
 from .config import TetherConfig
+from .publish import OnPublish
 from .status import StatusEvent
 
 if TYPE_CHECKING:
@@ -31,8 +32,12 @@ class Tether:
     def __init__(self, config: TetherConfig | None = None, client: Any | None = None,
                  *, tools: list | None = None,
                  bundles: tuple[str, ...] = ("code", "files", "web"),
-                 on_status: _StatusSink | None = None) -> None:
+                 on_status: _StatusSink | None = None,
+                 agent_instructions: str | None = None,
+                 on_publish: OnPublish | None = None) -> None:
         self.config = config or TetherConfig()
+        self._agent_instructions = agent_instructions
+        self._on_publish = on_publish
         self._client = client
         self._tools = tools or []
         self._bundles = bundles
@@ -58,14 +63,21 @@ class Tether:
         return self._manager
 
     async def aopen(self, session_id: str | None = None, *,
-                    tools: list | None = None) -> Conversation:
+                    tools: list | None = None,
+                    agent_instructions: str | None = None,
+                    on_publish: OnPublish | None = None) -> Conversation:
         """Open (or resume) a persistent continuous Conversation by id.
 
         Lazy manager init is single-event-loop safe (the None-check/assign has no ``await``); it is
         not safe to first-touch ``aopen`` from multiple OS threads — drive continuous sessions from
         one loop, the v1 contract for both AG-UI and the async terminal loop.
+
+        ``agent_instructions`` and ``on_publish`` override the Tether-level defaults for this
+        conversation.
         """
-        return await self._sessions().aopen(session_id, tools=tools)
+        return await self._sessions().aopen(session_id, tools=tools,
+                                            agent_instructions=agent_instructions,
+                                            on_publish=on_publish)
 
     async def aclose_sessions(self) -> None:
         """Close every live continuous Conversation (host shutdown)."""
@@ -78,7 +90,8 @@ class Tether:
             await self._manager.sweep()
 
     async def asolve(self, problem: str, tools: list | None = None, *,
-                     on_status: _StatusSink | None = None, keep: bool = False) -> Result:
+                     on_status: _StatusSink | None = None, keep: bool = False,
+                     agent_instructions: str | None = None) -> Result:
         """Run one ephemeral one-shot: open a Conversation, ask, reap the workspace (unless ``keep``).
 
         The one-shot uses ``config.root_dir`` verbatim. With ``root_dir=None`` each call gets its own
@@ -92,7 +105,10 @@ class Tether:
         sink = on_status if on_status is not None else self._on_status
         conv = await Conversation.acreate(
             id="oneshot", config=self.config, client=self._make_client(),
-            tools=self._tools + (tools or []), bundles=self._bundles, reap_on_close=not keep)
+            tools=self._tools + (tools or []), bundles=self._bundles, reap_on_close=not keep,
+            agent_instructions=(agent_instructions if agent_instructions is not None
+                                else self._agent_instructions),
+            on_publish=self._on_publish)
         if sink is not None:
             conv.session.subscribe(sink)
         try:
@@ -123,12 +139,16 @@ class Tether:
             yield event
 
     def solve(self, problem: str, tools: list | None = None, *,
-              on_status: _StatusSink | None = None, keep: bool = False) -> Result:
-        return asyncio.run(self.asolve(problem, tools=tools, on_status=on_status, keep=keep))
+              on_status: _StatusSink | None = None, keep: bool = False,
+              agent_instructions: str | None = None) -> Result:
+        return asyncio.run(self.asolve(problem, tools=tools, on_status=on_status, keep=keep,
+                                       agent_instructions=agent_instructions))
 
 
 def solve(problem: str, *, tools: list | None = None,
           config: TetherConfig | None = None, client: Any | None = None,
-          on_status: _StatusSink | None = None, keep: bool = False) -> Result:
+          on_status: _StatusSink | None = None, keep: bool = False,
+          agent_instructions: str | None = None) -> Result:
     """One-shot convenience: build a Tether and solve a single problem (ephemeral unless keep)."""
-    return Tether(config, client=client, tools=tools, on_status=on_status).solve(problem, keep=keep)
+    return Tether(config, client=client, tools=tools, on_status=on_status,
+                  agent_instructions=agent_instructions).solve(problem, keep=keep)

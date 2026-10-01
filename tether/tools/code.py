@@ -12,8 +12,9 @@ def run_python(session: Session, code: str | None = None, path: str | None = Non
                args: list[str] | None = None) -> dict:
     """Run Python in the sandbox. Provide ``path`` (a script file under the root) or
     ``code`` (inline, written to a scratch script then run). Scripts may use the injected
-    ``load(id)`` / ``save(id, obj)`` / ``emit(obj)`` helpers. Returns the ExecResult fields:
-    ``stdout, stderr, result, error, exit_code, new_handles, killed_by``.
+    ``load(id)`` / ``save(id, obj)`` / ``emit(obj)`` / ``publish(path)`` helpers. Returns the
+    ExecResult fields: ``stdout, stderr, result, error, exit_code, new_handles, killed_by,
+    published``.
     """
     report_progress("running script in sandbox", tool="run_python")
     if path is not None:

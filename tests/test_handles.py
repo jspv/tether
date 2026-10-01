@@ -139,3 +139,33 @@ def test_rehydrate_skips_corrupt_record(tmp_path):
     mf.write_text(json.dumps(data))
     s2 = HandleStore(tmp_path)                         # must not raise
     assert "h1" in s2.manifest() and "bad" not in s2.manifest()
+
+
+def test_put_input_registers_binary_handle(tmp_path):
+    store = HandleStore(tmp_path)
+    (tmp_path / "inputs" / "f1").mkdir(parents=True)
+    (tmp_path / "inputs" / "f1" / "a.csv").write_bytes(b"x")
+    h = store.put_input(path="inputs/f1/a.csv", size=1, preview="p", source="upload:a.csv",
+                        input_id="f1", content_type="text/csv", description="d")
+    assert (h.kind, h.input_id, h.content_type, h.description) == ("binary", "f1", "text/csv", "d")
+    assert store.inputs() == {"f1": h}
+    assert store.get(h.id) == str((tmp_path / "inputs/f1/a.csv").resolve())
+
+
+def test_put_input_is_idempotent_and_survives_reload(tmp_path):
+    store = HandleStore(tmp_path)
+    h = store.put_input(path="inputs/f1/a.csv", size=1, preview="p", source="s", input_id="f1")
+    assert store.put_input(path="inputs/f1/b.csv", size=9, preview="q", source="s",
+                           input_id="f1") == h
+    assert HandleStore(tmp_path).inputs() == {"f1": h}
+
+
+def test_put_input_rejects_escaping_path(tmp_path):
+    with pytest.raises(ValueError):
+        HandleStore(tmp_path).put_input(path="../x", size=1, preview="p", source="s",
+                                        input_id="f1")
+
+
+def test_non_input_summary_has_no_input_fields(tmp_path):
+    s = HandleStore(tmp_path).put("hello", source="t").summary()
+    assert not {"input_id", "content_type", "description"} & s.keys()
