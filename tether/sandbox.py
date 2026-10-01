@@ -140,8 +140,13 @@ class _OrchestratedSandbox:
                 f.unlink(missing_ok=True)
 
     def _ingest_new_handles(self, new_handles_file: Path) -> list[str]:
-        """Register handles the child wrote. Tolerant: a corrupt line is skipped, not fatal, so
-        one bad record can't abort ingestion or leave the store inconsistent."""
+        """Adopt handles the child wrote.
+
+        Records are untrusted: ``adopt`` derives all metadata from the file itself and
+        refuses an id that already exists. Tolerant by design -- a rejected or corrupt
+        record is skipped, not fatal, so one bad record cannot abort ingestion or leave
+        the store inconsistent.
+        """
         ids: list[str] = []
         if not new_handles_file.exists():
             return ids
@@ -151,9 +156,10 @@ class _OrchestratedSandbox:
                 continue
             try:
                 rec = json.loads(line)
-                self.store.register(rec)
-                ids.append(rec["id"])
-            except (json.JSONDecodeError, ValueError, KeyError):
+                handle = self.store.adopt(id=rec["id"], kind=rec["kind"],
+                                          path=rec["path"], source=rec.get("source", "run_python"))
+                ids.append(handle.id)
+            except (json.JSONDecodeError, ValueError, KeyError, TypeError):
                 continue
         return ids
 

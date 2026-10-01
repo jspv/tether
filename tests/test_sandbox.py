@@ -291,3 +291,68 @@ def test_dataframe_preview_matches_between_parent_and_child(tmp_path):
 
     assert child_handle.preview == parent_handle.preview
     assert "5 of 10 rows" in child_handle.preview  # suffix present on both sides
+
+
+def test_child_record_carries_no_metadata(tmp_path):
+    """The child reports id/kind/path/source and nothing else."""
+    sb, store = _sandbox(tmp_path)
+    res = sb.run_code(
+        "import pandas as pd\n"
+        "from tether_sandbox import save\n"
+        "save('h1', pd.DataFrame({'a': [1, 2, 3]}))\n"
+    )
+    assert res.error is None, res.error
+    assert res.new_handles == ["h1"]
+    # metadata came from the parent, computed from the file
+    assert store.summary("h1")["n_rows"] == 3
+    assert store.summary("h1")["schema"] == {"a": "int64"}
+
+
+def test_forged_child_metadata_is_overridden(tmp_path):
+    """A child writing a record by hand cannot make the store report false metadata."""
+    sb, store = _sandbox(tmp_path)
+    res = sb.run_code(
+        "import json, os\n"
+        "import pandas as pd\n"
+        "pd.DataFrame({'a': range(1000)}).to_parquet(os.path.join('handles', 'h1.parquet'))\n"
+        "rec = {'id': 'h1', 'kind': 'dataframe', 'path': 'handles/h1.parquet',\n"
+        "       'source': 'run_python', 'n_rows': 2, 'preview': 'all clean!',\n"
+        "       'bytes': 10, 'schema': {'a': 'string'}}\n"
+        "open(os.environ['TETHER_NEW_HANDLES'], 'a').write(json.dumps(rec) + '\\n')\n"
+    )
+    assert res.error is None, res.error
+    summary = store.summary("h1")
+    assert summary["n_rows"] == 1000              # not the claimed 2
+    assert summary["preview"] != "all clean!"
+    assert summary["schema"] == {"a": "int64"}    # not the claimed string
+    assert summary["bytes"] > 10
+
+
+def test_child_cannot_repoint_an_existing_handle(tmp_path):
+    """Adopting an existing id is refused; ingestion stays tolerant and continues."""
+    sb, store = _sandbox(tmp_path)
+    original = store.put({"trusted": True}, source="parent")
+    res = sb.run_code(
+        "import json, os\n"
+        f"rec = {{'id': {original.id!r}, 'kind': 'text', 'path': 'handles/evil.txt',\n"
+        "       'source': 'run_python'}\n"
+        "open(os.path.join('handles', 'evil.txt'), 'w').write('attacker data')\n"
+        "open(os.environ['TETHER_NEW_HANDLES'], 'a').write(json.dumps(rec) + '\\n')\n"
+    )
+    assert res.error is None, res.error
+    assert res.new_handles == []                                  # rejected
+    assert store.summary(original.id) == original.summary()       # untouched
+
+
+def test_one_corrupt_record_does_not_abort_ingestion(tmp_path):
+    sb, store = _sandbox(tmp_path)
+    res = sb.run_code(
+        "import json, os\n"
+        "open(os.path.join('handles', 'a.txt'), 'w').write('a')\n"
+        "f = open(os.environ['TETHER_NEW_HANDLES'], 'a')\n"
+        "f.write('{not json\\n')\n"
+        "f.write(json.dumps({'id': 'h1', 'kind': 'text', 'path': 'handles/a.txt',\n"
+        "                    'source': 'run_python'}) + '\\n')\n"
+        "f.close()\n"
+    )
+    assert res.new_handles == ["h1"]

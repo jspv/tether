@@ -19,10 +19,6 @@ _REGISTRY = json.loads(Path(os.environ["TETHER_REGISTRY"]).read_text(encoding="u
 _NEW = Path(os.environ["TETHER_NEW_HANDLES"])
 _EMIT = Path(os.environ["TETHER_EMIT"])
 
-_PREVIEW_CHARS = 800
-_PREVIEW_ROWS = 5
-
-
 def load(handle_id: str) -> Any:
     meta = _REGISTRY[handle_id]
     path = _ROOT / meta["path"]
@@ -38,35 +34,27 @@ def load(handle_id: str) -> Any:
 
 
 def save(handle_id: str, obj: Any, source: str = "run_python") -> str:
+    """Write ``obj`` as a handle file and tell the parent it exists.
+
+    Only id/kind/path/source are reported: the parent derives every field that reaches
+    model context from the bytes on disk, so there is nothing to keep in sync here and
+    nothing this side can misreport.
+    """
     import pandas as pd
 
     if isinstance(obj, pd.DataFrame):
-        rel = f"handles/{handle_id}.parquet"
+        kind, rel = "dataframe", f"handles/{handle_id}.parquet"
         obj.to_parquet(_ROOT / rel)
-        # Preview must match HandleStore._write_dataframe exactly (kept in sync by hand;
-        # the child cannot import the tether package). See tests for parity check.
-        preview = obj.head(_PREVIEW_ROWS).to_csv(index=False)
-        if len(obj) > _PREVIEW_ROWS:
-            preview += f"... ({_PREVIEW_ROWS} of {len(obj)} rows)"
-        rec = {"id": handle_id, "kind": "dataframe", "path": rel, "source": source,
-               "bytes": (_ROOT / rel).stat().st_size, "preview": preview,
-               "schema": {c: str(t) for c, t in obj.dtypes.items()},
-               "n_rows": int(len(obj)), "n_cols": int(obj.shape[1])}
     elif isinstance(obj, (dict, list)):
-        rel = f"handles/{handle_id}.json"
-        text = json.dumps(obj, default=str)
-        (_ROOT / rel).write_text(text, encoding="utf-8")
-        rec = {"id": handle_id, "kind": "json", "path": rel, "source": source,
-               "bytes": len(text.encode()), "preview": text[:_PREVIEW_CHARS]}
+        kind, rel = "json", f"handles/{handle_id}.json"
+        (_ROOT / rel).write_text(json.dumps(obj, default=str), encoding="utf-8")
     else:
-        rel = f"handles/{handle_id}.txt"
-        text = str(obj)
-        (_ROOT / rel).write_text(text, encoding="utf-8")
-        rec = {"id": handle_id, "kind": "text", "path": rel, "source": source,
-               "bytes": len(text.encode()), "preview": text[:_PREVIEW_CHARS]}
+        kind, rel = "text", f"handles/{handle_id}.txt"
+        (_ROOT / rel).write_text(str(obj), encoding="utf-8")
 
     with _NEW.open("a") as f:
-        f.write(json.dumps(rec) + "\n")
+        f.write(json.dumps({"id": handle_id, "kind": kind, "path": rel,
+                            "source": source}) + "\n")
     return handle_id
 
 
