@@ -1408,10 +1408,26 @@ def test_fetch_url_returns_structured_error_for_internal_address(tmp_path):
         lambda r: httpx.Response(200, text="should never be reached")),
         follow_redirects=False)
     with client:
+        out = fetch_url(session, "http://10.0.0.1/admin", client=client)
+    assert out["status"] is None
+    assert "blocked by egress policy" in out["error"]   # the wrapper fetch_url adds
+    assert "blocked internal address" in out["error"]   # the reason egress gave
+    assert out["url"] == "http://10.0.0.1/admin"
+
+
+def test_fetch_url_blocks_cloud_metadata_with_its_own_reason(tmp_path):
+    """Metadata endpoints raise a DIFFERENT message than ordinary internal addresses
+    ("blocked cloud metadata endpoint", not "blocked internal address"), because they are
+    denied unconditionally ahead of the allowlist. Asserting the generic wording here would
+    pass for the wrong reason, or fail spuriously."""
+    session = _session(tmp_path)
+    client = httpx.Client(transport=httpx.MockTransport(
+        lambda r: httpx.Response(200, text="should never be reached")),
+        follow_redirects=False)
+    with client:
         out = fetch_url(session, "http://169.254.169.254/latest/meta-data/", client=client)
     assert out["status"] is None
-    assert "blocked internal address" in out["error"]
-    assert out["url"] == "http://169.254.169.254/latest/meta-data/"
+    assert "blocked cloud metadata endpoint" in out["error"]
 
 
 def test_fetch_url_allows_an_allowlisted_internal_host(tmp_path):
