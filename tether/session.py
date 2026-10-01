@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import shutil
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -11,7 +12,8 @@ from . import bundles as _bundles
 from .config import TetherConfig, SandboxConfig
 from .handles import HandleStore
 from .sandbox import (
-    ControlPlaneLimits, LocalSubprocessSandbox, SandboxExecutor, SandboxRuntimeUnavailable,
+    ControlPlaneLimits, LocalSubprocessSandbox, NoSandboxIsolationWarning,
+    SandboxExecutor, SandboxRuntimeUnavailable,
 )
 from .status import StatusBus, StatusEvent, bind_bus
 
@@ -197,4 +199,18 @@ def _build_sandbox(root: Path, store: HandleStore, sandbox_config: SandboxConfig
                 f'model-authored code. Install podman or docker, or set '
                 f'TetherConfig.sandbox.backend = "local" to run it with no isolation.'
             ) from e
+    if sandbox_config.backend != "local":
+        raise ValueError(
+            f"unknown sandbox backend {sandbox_config.backend!r}; expected 'container' "
+            f"(real isolation, the default) or 'local' (NO isolation). Note "
+            f"TETHER_SANDBOX_BACKEND selects the tier, not the container runtime -- "
+            f"use SandboxConfig.container_runtime for that."
+        )
+    warnings.warn(
+        "sandbox backend 'local' provides NO isolation: run_python executes "
+        "model-authored code as the host user. Use the 'container' backend for a real "
+        "boundary.",
+        NoSandboxIsolationWarning,
+        stacklevel=2,
+    )
     return LocalSubprocessSandbox(root=root, store=store, config=sandbox_config, limits=limits)

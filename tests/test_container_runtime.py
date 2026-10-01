@@ -208,3 +208,31 @@ def test_build_sandbox_surfaces_dead_runtime_as_unavailable(tmp_path, monkeypatc
         _build_sandbox(tmp_path / "r", store, SandboxConfig(backend="container"))
     assert "Cannot connect to Podman" in str(excinfo.value)
     assert 'backend = "local"' in str(excinfo.value)
+
+
+# --- fail closed on unknown backend; local tier leaves a trace -------------------------
+
+@pytest.mark.parametrize("bad", ["Container", "CONTAINER", "contianer", "podman", "docker", ""])
+def test_unknown_backend_fails_closed(tmp_path, bad):
+    store = HandleStore(tmp_path / "r")
+    with pytest.raises(ValueError) as excinfo:
+        _build_sandbox(tmp_path / "r", store, SandboxConfig(backend=bad))
+    message = str(excinfo.value)
+    assert "'container'" in message and "'local'" in message
+    assert "container_runtime" in message       # podman/docker are not tier names
+
+
+def test_valid_backends_still_build(tmp_path, monkeypatch):
+    monkeypatch.setattr("tether.container_runtime.detect_runtime",
+                        lambda override, which=None: "podman")
+    store = HandleStore(tmp_path / "r")
+    assert type(_build_sandbox(tmp_path / "r", store,
+                               SandboxConfig(backend="local"))).__name__ == "LocalSubprocessSandbox"
+
+
+def test_local_tier_emits_no_isolation_warning(tmp_path):
+    from tether import NoSandboxIsolationWarning
+
+    store = HandleStore(tmp_path / "r")
+    with pytest.warns(NoSandboxIsolationWarning, match="NO isolation"):
+        _build_sandbox(tmp_path / "r", store, SandboxConfig(backend="local"))

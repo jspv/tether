@@ -36,3 +36,19 @@ def _disabled_local_sandbox(monkeypatch):
     deletes the variable rather than relying on this fixture.
     """
     monkeypatch.setenv("TETHER_SANDBOX_BACKEND", "local")
+
+
+@pytest.fixture(autouse=True)
+def _quiet_no_isolation_warning():
+    """The suite deliberately runs the local tier; keep its warning out of the output.
+
+    ``pytest.warns`` installs its own filter, so the test asserting the warning is emitted
+    is unaffected by this.
+    """
+    import warnings
+
+    from tether.sandbox import NoSandboxIsolationWarning
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", NoSandboxIsolationWarning)
+        yield

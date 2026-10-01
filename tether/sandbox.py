@@ -29,6 +29,10 @@ _MAX_REPORTED_IDS = 5   # distinct rejected ids named in an error message
 _MAX_REPORTED_ID_LEN = 64
 
 
+class NoSandboxIsolationWarning(UserWarning):
+    """Raised when the local tier is selected: sandboxed code runs as the host user."""
+
+
 class SandboxRuntimeUnavailable(RuntimeError):
     """Raised when the container backend is selected but no container runtime exists."""
 

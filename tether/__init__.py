@@ -5,6 +5,7 @@ from .config import FetchConfig, TetherConfig, SandboxConfig
 from .handles import Handle, HandleStore
 from .paths import PathEscapesRootError, safe_path
 from .sandbox import ExecResult, LocalSubprocessSandbox, SandboxExecutor, SandboxRuntimeUnavailable
+from .sandbox import NoSandboxIsolationWarning
 from .sandbox_container import ContainerSandbox
 from .session import Session
 from .conversation import Conversation
@@ -19,7 +20,7 @@ __all__ = [
     "FetchConfig", "TetherConfig", "SandboxConfig",
     "Handle", "HandleStore",
     "PathEscapesRootError", "safe_path",
-    "ExecResult", "LocalSubprocessSandbox", "SandboxExecutor", "SandboxRuntimeUnavailable",
+    "ExecResult", "LocalSubprocessSandbox", "SandboxExecutor", "SandboxRuntimeUnavailable", "NoSandboxIsolationWarning",
     "ContainerSandbox",
     "Session",
     "Conversation", "SessionManager",
