@@ -1,11 +1,15 @@
+import os
+
+import httpx
+
 import tether.tools.documents as docmod
 from tether import TetherConfig, Session
-from tether.config import DocumentConfig
+from tether.config import DocumentConfig, FetchConfig
 from tether.tools.documents import prefetch_models, read_document
 
 
-def _session(tmp_path):
-    return Session.create(TetherConfig(root_dir=tmp_path / "r"))
+def _session(tmp_path, **fetch_kw):
+    return Session.create(TetherConfig(root_dir=tmp_path / "r", fetch=FetchConfig(**fetch_kw)))
 
 
 def test_path_source_converts_to_markdown_handle(tmp_path):
@@ -33,17 +37,97 @@ def test_path_is_resolved_under_root_before_conversion(tmp_path):
     assert seen["src"] == str(sess.root / "sub" / "doc.docx")
 
 
-def test_url_source_is_passed_through_unchanged(tmp_path):
-    sess = _session(tmp_path)
-    seen = {}
+def test_read_document_blocks_an_internal_url(tmp_path):
+    session = _session(tmp_path)
+    out = read_document(session, "http://169.254.169.254/latest/meta-data/",
+                        convert=lambda src: "should never run")
+    assert "error" in out
+    assert "blocked by egress policy" in out["error"]
 
-    def fake_convert(src):
-        seen["src"] = src
-        return "# remote"
 
-    summary = read_document(sess, "https://example.com/a.pdf", convert=fake_convert)
-    assert seen["src"] == "https://example.com/a.pdf"
-    assert summary["kind"] == "text"
+def test_read_document_hands_the_converter_a_local_path_not_a_url(tmp_path, monkeypatch):
+    """Docling must never receive the URL: it would follow its own redirects, outside
+    the guard. We download through guarded_get and convert the local file."""
+    session = _session(tmp_path)
+    seen = []
+
+    def fake_guarded_get(url, cfg, *, client, resolve=None):
+        seen.append(url)
+        return httpx.Response(200, content=b"%PDF-1.4 fake",
+                              headers={"content-type": "application/pdf"})
+
+    monkeypatch.setattr("tether.tools.documents.guarded_get", fake_guarded_get)
+
+    converted = []
+
+    def convert(src: str) -> str:
+        converted.append(src)
+        return "# Title\n\nbody"
+
+    out = read_document(session, "https://example.com/report.pdf", convert=convert)
+
+    assert out["kind"] == "text"
+    assert seen == ["https://example.com/report.pdf"]
+    assert len(converted) == 1
+    assert not converted[0].startswith("http")           # a local path, never the URL
+    assert str(session.root) in converted[0]             # and inside the session root
+
+
+def test_read_document_still_converts_a_workspace_path(tmp_path):
+    session = _session(tmp_path)
+    (session.root / "doc.txt").write_text("hello", encoding="utf-8")
+    converted = []
+
+    def convert(src: str) -> str:
+        converted.append(src)
+        return "# hello"
+
+    out = read_document(session, "doc.txt", convert=convert)
+    assert out["kind"] == "text"
+    assert converted[0] == str(session.root / "doc.txt")
+
+
+def test_read_document_reports_a_download_failure(tmp_path, monkeypatch):
+    session = _session(tmp_path)
+
+    def failing(url, cfg, *, client, resolve=None):
+        raise httpx.HTTPError("connection reset")
+
+    monkeypatch.setattr("tether.tools.documents.guarded_get", failing)
+    out = read_document(session, "https://example.com/x.pdf", convert=lambda s: "")
+    assert "could not download" in out["error"]
+
+
+def test_read_document_caps_the_downloaded_body_at_max_bytes(tmp_path, monkeypatch):
+    session = _session(tmp_path, max_bytes=10)
+    monkeypatch.setattr("tether.tools.documents.guarded_get",
+                        lambda url, cfg, *, client, resolve=None:
+                        httpx.Response(200, content=b"x" * 100))
+    sizes = []
+    out = read_document(session, "https://example.com/big.pdf",
+                        convert=lambda src: sizes.append(os.path.getsize(src)) or "# md")
+    assert out["kind"] == "text"
+    assert sizes == [10]
+
+
+def test_read_document_closes_its_client_on_every_path(tmp_path, monkeypatch):
+    session = _session(tmp_path)
+    clients = []
+    real_client = httpx.Client
+
+    def tracking_client(*a, **kw):
+        c = real_client(*a, **kw)
+        clients.append(c)
+        return c
+
+    monkeypatch.setattr("tether.tools.documents.httpx.Client", tracking_client)
+
+    def failing(url, cfg, *, client, resolve=None):
+        raise httpx.HTTPError("boom")
+
+    monkeypatch.setattr("tether.tools.documents.guarded_get", failing)
+    read_document(session, "https://example.com/x.pdf", convert=lambda s: "")
+    assert len(clients) == 1 and clients[0].is_closed
 
 
 def test_path_escape_returns_structured_error(tmp_path):

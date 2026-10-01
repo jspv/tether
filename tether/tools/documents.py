@@ -1,7 +1,8 @@
 """read_document: convert a PDF/Office/spreadsheet to clean markdown (with tables) via Docling.
 
 The source may be a workspace-relative path (resolved + jailed by safe_path) or an http(s)
-URL (passed straight to Docling, which fetches it). The markdown is stored as a text handle
+URL (downloaded through the egress guard into the session root first, so Docling only ever
+receives a local path and never makes its own network requests). The markdown is stored as a text handle
 and only the summary is returned, keeping large document text out of the model's context.
 
 Following the fetch_url/web convention, every failure -- a path escaping the root, an unknown
@@ -12,12 +13,23 @@ seam is injectable so unit tests never need real Docling (heavy, downloads model
 
 from __future__ import annotations
 
+import os
+import tempfile
+from pathlib import Path
 from typing import Callable
 from urllib.parse import urlparse
 
+import httpx
+
+from ..egress import BlockedAddressError, guarded_get
 from ..paths import PathEscapesRootError, safe_path
 from ..session import Session
 from ..status import report_progress
+
+_USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
 
 
 def _docling_convert(source: str, ocr: bool = False) -> str:
@@ -39,6 +51,32 @@ def _docling_convert(source: str, ocr: bool = False) -> str:
     return converter.convert(source).document.export_to_markdown()
 
 
+def _download(session: Session, url: str) -> Path:
+    """Fetch ``url`` through the egress guard into the session root; return the local path.
+
+    The filename keeps the URL's extension so Docling can infer the format, and lands under
+    a dedicated subdirectory so downloads are not mistaken for user artifacts.
+    """
+    cfg = session.config.fetch
+    suffix = Path(urlparse(url).path).suffix or ".bin"
+    dest_dir = session.root / ".documents"
+    dest_dir.mkdir(exist_ok=True)
+
+    client = httpx.Client(timeout=cfg.timeout_s, follow_redirects=False,
+                          headers={"User-Agent": _USER_AGENT})
+    try:
+        resp = guarded_get(url, cfg, client=client)
+        if resp.is_error:  # 4xx/5xx -> reported as a download failure by the caller
+            raise httpx.HTTPError(f"HTTP {resp.status_code}")
+        fd, abspath = tempfile.mkstemp(prefix="doc_", suffix=suffix, dir=dest_dir)
+        os.close(fd)
+        dest = Path(abspath)
+        dest.write_bytes(resp.content[:cfg.max_bytes])
+        return dest
+    finally:
+        client.close()
+
+
 def read_document(session: Session, source: str,
                   convert: Callable[[str], str] | None = None) -> dict:
     """Convert ``source`` (a workspace path or http(s) URL) to a clean-markdown handle.
@@ -49,7 +87,16 @@ def read_document(session: Session, source: str,
     """
     scheme = urlparse(source).scheme
     if scheme in ("http", "https"):
-        target = source
+        # Docling fetches URLs itself and follows its own redirects, which egress policy
+        # cannot see. Download through the guard instead and convert the local file, so
+        # every hop is validated and Docling has exactly one input shape: a local path.
+        try:
+            downloaded = _download(session, source)
+        except BlockedAddressError as e:
+            return {"error": f"blocked by egress policy: {e}", "source": source}
+        except httpx.HTTPError as e:
+            return {"error": f"could not download {source!r}: {e}", "source": source}
+        target = str(downloaded)
     elif scheme == "":
         try:
             target = str(safe_path(session.root, source))
