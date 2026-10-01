@@ -83,10 +83,11 @@ stay green, which is the point of doing this first.
 **Interfaces:**
 - Consumes: nothing from earlier tasks.
 - Produces: `HandleStore._describe_dataframe(path: Path) -> dict[str, Any]`,
-  `_describe_json(path: Path) -> dict[str, Any]`, `_describe_text(path: Path) -> dict[str, Any]`,
+  `_describe_textual(path: Path) -> dict[str, Any]` (serves BOTH the `json` and `text` kinds —
+  their descriptions are identical, so there is one body, not two copies), and
   `_describe_binary(path: Path) -> dict[str, Any]`. Each returns a dict with keys
   `bytes`, `preview`, and for dataframes additionally `schema`, `n_rows`, `n_cols`.
-  Task 2 calls all four.
+  Task 2 dispatches to all three.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -155,11 +156,11 @@ def test_describe_text_and_json_bound_the_preview(tmp_path):
     store = HandleStore(tmp_path / "r")
     text_path = store.root / "handles" / "x.txt"
     text_path.write_text("z" * 10_000, encoding="utf-8")
-    assert len(store._describe_text(text_path)["preview"]) == 800
+    assert len(store._describe_textual(text_path)["preview"]) == 800
 
     json_path = store.root / "handles" / "x.json"
     json_path.write_text('["' + "z" * 10_000 + '"]', encoding="utf-8")
-    assert len(store._describe_json(json_path)["preview"]) == 800
+    assert len(store._describe_textual(json_path)["preview"]) == 800
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
@@ -202,11 +203,10 @@ output to today's pandas path for mixed, small, empty, and nullable-`Int64` fram
             "n_cols": int(len(schema_df.columns)),
         }
 
-    def _describe_json(self, path: Path) -> dict[str, Any]:
-        text = path.read_text(encoding="utf-8")
-        return {"bytes": len(text.encode()), "preview": text[:_PREVIEW_CHARS]}
-
-    def _describe_text(self, path: Path) -> dict[str, Any]:
+    def _describe_textual(self, path: Path) -> dict[str, Any]:
+        """Describe a json or text handle. One body serves both kinds: their summaries are
+        identical, and two copies of this would drift the first time one format needed
+        different preview handling."""
         text = path.read_text(encoding="utf-8")
         return {"bytes": len(text.encode()), "preview": text[:_PREVIEW_CHARS]}
 
@@ -242,14 +242,14 @@ Then rewrite the writers to write-then-describe, so one code path produces metad
         path = self.root / rel
         path.write_text(json.dumps(obj, default=str), encoding="utf-8")
         return Handle(id=hid, kind="json", path=rel, source=source,
-                      **self._describe_json(path))
+                      **self._describe_textual(path))
 
     def _write_text(self, hid: str, obj: str, source: str) -> Handle:
         rel = f"handles/{hid}.txt"
         path = self.root / rel
         path.write_text(obj, encoding="utf-8")
         return Handle(id=hid, kind="text", path=rel, source=source,
-                      **self._describe_text(path))
+                      **self._describe_textual(path))
 ```
 
 - [ ] **Step 4: Run the full suite — this is a refactor, nothing may regress**
@@ -393,8 +393,9 @@ Expected: FAIL — `AttributeError: 'HandleStore' object has no attribute 'adopt
 Add to `tether/handles.py`, directly after `register`:
 
 ```python
-    _DESCRIBERS = {"dataframe": "_describe_dataframe", "json": "_describe_json",
-                   "text": "_describe_text", "binary": "_describe_binary"}
+    # json and text describe identically, so both kinds dispatch to the one shared body.
+    _DESCRIBERS = {"dataframe": "_describe_dataframe", "json": "_describe_textual",
+                   "text": "_describe_textual", "binary": "_describe_binary"}
 
     def adopt(self, *, id: str, kind: str, path: str, source: str) -> Handle:
         """Register a file written by sandboxed code, deriving its metadata here.
