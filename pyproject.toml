@@ -82,6 +82,3 @@ only-include = ["tether"]
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
-
-[tool.ruff]
-exclude = [".claude"]

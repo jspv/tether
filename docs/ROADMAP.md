@@ -61,9 +61,9 @@ Real but low-severity; each is a contained fix.
 - **`max_file_size_mb` is silently ignored on the container tier** — now the default backend,
   so the config field does nothing by default. Documented as local-tier-only in the README;
   a container-side equivalent (or a warning when it is set) is still open.
-- **Ruff scanned agent worktrees.** The tooling worktree directory is now excluded in
-  `pyproject.toml`, so `ruff check .` no longer reports copies of the code. The remaining
-  lint findings (unused imports, late imports in tests) are pre-existing and untouched.
+- **Bare `ruff check .` also scans agent worktree directories** and over-reports. Use the
+  scoped `ruff check tether tests` (8 pre-existing findings: unused imports, late imports in
+  tests).
 - **`_OrchestratedSandbox` is sequential and not re-entrant per root** — fine at current
   scale; revisit if concurrent runs per conversation are ever needed.
 
