@@ -146,9 +146,17 @@ class HandleStore:
     def _describe_textual(self, path: Path) -> dict[str, Any]:
         """Describe a json or text handle. One body serves both kinds: their summaries are
         identical, and two copies of this would drift the first time one format needed
-        different preview handling."""
-        text = path.read_text(encoding="utf-8")
-        return {"bytes": len(text.encode()), "preview": text[:_PREVIEW_CHARS]}
+        different preview handling.
+
+        Reads only the preview window, never the whole file: ``adopt`` routes
+        sandbox-authored files through here, and the container tier does not cap how large
+        a file the child may write. ``f.read(n)`` on a text stream returns n *characters*
+        with multibyte sequences handled, and ``st_size`` is the file's byte length -- which
+        for the UTF-8 files ``put`` writes equals the encoded length of the text.
+        """
+        with path.open(encoding="utf-8") as f:
+            preview = f.read(_PREVIEW_CHARS)
+        return {"bytes": path.stat().st_size, "preview": preview}
 
     def _describe_binary(self, path: Path) -> dict[str, Any]:
         size = path.stat().st_size

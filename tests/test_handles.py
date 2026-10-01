@@ -315,3 +315,52 @@ def test_adopt_and_put_produce_identical_summaries(tmp_path):
     adopted = other.adopt(id="h1", kind="dataframe", path=rel, source="same")
 
     assert adopted.summary() == put_handle.summary()
+
+
+def test_adopt_rejects_kind_content_mismatch(tmp_path):
+    """A child may claim any kind for any file. Mismatches must surface as ValueError --
+    the documented contract that ingestion's `except ValueError` relies on.
+
+    This pins behavior that comes from third-party exception hierarchies:
+    pyarrow's ArrowInvalid and UnicodeDecodeError both subclass ValueError today.
+    """
+    store = HandleStore(tmp_path / "r")
+
+    (store.root / "handles" / "fake.parquet").write_text("not parquet at all")
+    with pytest.raises(ValueError):
+        store.adopt(id="h1", kind="dataframe", path="handles/fake.parquet", source="run_python")
+
+    (store.root / "handles" / "blob.txt").write_bytes(b"\xff\xfe\x00\x01binary\x80\x81")
+    with pytest.raises(ValueError):
+        store.adopt(id="h2", kind="text", path="handles/blob.txt", source="run_python")
+
+
+def test_describe_textual_does_not_read_the_whole_file(tmp_path, monkeypatch):
+    """Bounding the preview is not enough -- the READ must be bounded too, or a huge
+    sandbox-written file exhausts parent memory before truncation ever happens."""
+    from pathlib import Path as PathlibPath
+
+    store = HandleStore(tmp_path / "r")
+    path = store.root / "handles" / "big.txt"
+    path.write_text("z" * 5_000_000, encoding="utf-8")
+
+    reads = []
+    real_open = PathlibPath.open
+
+    def spy(self, *args, **kwargs):
+        handle = real_open(self, *args, **kwargs)
+        real_read = handle.read
+
+        def tracked(n=-1):
+            reads.append(n)
+            return real_read(n)
+
+        handle.read = tracked
+        return handle
+
+    monkeypatch.setattr(PathlibPath, "open", spy)
+    described = store._describe_textual(path)
+
+    assert reads == [800]              # a bounded read, never read() or read(-1)
+    assert len(described["preview"]) == 800
+    assert described["bytes"] == 5_000_000
