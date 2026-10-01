@@ -234,8 +234,9 @@ walks. With runs serialized and timeouts enforced, no child runs during those op
 ## Known gaps (deferred from final review, 2026-10-01)
 
 Eight findings the final review graded Minor were deferred at merge. They are recorded here so
-they live in the repo, each with its planned fix. Status: **open**; fixes in progress on
-`fix/known-gaps` (plan: `docs/superpowers/plans/2026-10-01-host-integration-known-gaps.md`).
+they live in the repo, each with its planned fix. Status: **fixed** on `fix/known-gaps`
+(plan: `docs/superpowers/plans/2026-10-01-host-integration-known-gaps.md`). G4 outcome: gated —
+sandbox `publish()` requires the `deliver` bundle.
 
 | # | Gap | Where | Planned fix |
 |---|---|---|---|
@@ -247,6 +248,32 @@ they live in the repo, each with its planned fix. Status: **open**; fixes in pro
 | G6 | **`aadd_input` blocks the event loop** while copying up to `max_input_bytes`. | `conversation.py` | Hold the turn lock, run the copy via `asyncio.to_thread`. |
 | G7 | **Unbounded copy of a host path.** The source is `stat`ed for size, then copied without a limit; a file that grows in between bypasses `max_input_bytes`. Low risk: the source is host-supplied. | `session.py` | Copy in a counted loop and abort (removing the temp file) once `max_input_bytes` is exceeded. |
 | G8 | **Build timeout leaks and doubling.** Killing `podman build` / the pip-layer CLI on timeout may leave the work running; `ensure_layer` gives the image build and the pip install each a full `build_timeout_s`. | `container_runtime.py` | One deadline per `ensure_layer` call shared across both steps; name the pip-layer container and `rm -f` it on timeout (as the sandbox does). An image build can't be cancelled by name; document that the runtime may finish it in the background. |
+
+**Tightened after the fixes' own review.** G1, G2, and G3 each had a remaining bypass, closed
+before merge:
+- G1: `validate_publication` no longer follows links at all. The path is normalized lexically,
+  then every component is `lstat`-ed from the root down; a symlink anywhere is refused. A link
+  like `<host dir>/../<root>/outputs` had still answered differently depending on whether the
+  host directory existed. Publishing through an in-root symlinked directory is now refused too.
+- G2: sandbox-adopted handle records have `input_id` / `content_type` / `description` stripped,
+  so only `Session.add_input` creates inputs. A repeat `add_input` compares the on-disk file
+  with the host's bytes (sha256): same bytes → reused without a copy (restart idempotency is
+  kept); different bytes → the host's bytes replace them under the same handle id. The record
+  is always re-derived from the file, so forged metadata (e.g. a poisoned preview) does not
+  survive.
+- G3: before removing a directory squatting on an input's filename, every real directory in
+  it is made writable (top-down, without following links), so a `0000` subdirectory cannot
+  block the upload.
+
+**Deferred from that review (Minor, open):**
+
+| # | Gap | Where |
+|---|---|---|
+| G9 | Cancelling `aadd_input` releases the turn lock while the worker thread is still copying; `aclose()` (which reaps the root) does not take the sandbox lock and could run during the copy. | `conversation.py` |
+| G10 | `Handle.bytes` for an input comes from the pre-copy `stat`, not the bytes actually copied. | `session.py` |
+| G11 | A failed `rm -f` of a timed-out pip-layer container is swallowed silently (the sandbox warns), and the timeout message reports the full `build_timeout_s` rather than the time that was left. | `container_runtime.py` |
+| G12 | Sandbox-adopted records can still overwrite any existing handle id, including an input's (`register` replaces by id). Owned by hardening WS1's `adopt()`, which refuses existing ids. | `handles.py`, `sandbox.py` |
+| G13 | `HandleStore._load_manifest` does not catch `RuntimeError` from a symlink-loop path in a forged manifest record, so a reopen can crash. | `handles.py` |
 
 Also outstanding, but owned by the hardening branch (see the plan's handoff note): the other
 control files (`_new_handles`, `_emit`, `_registry`) and the `.scripts/` directory still need

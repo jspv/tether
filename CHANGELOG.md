@@ -45,6 +45,22 @@ All changes are additive: existing call sites keep working with the defaults.
   runtime CLI was killed and the container kept running.
 - Control files use random per-run names.
 
+### Known-gap fixes
+- Publishing never follows links, so its answers no longer reveal whether a host path exists.
+  **Behavior change:** publishing through a symlinked directory inside the workspace is
+  refused; use the real path.
+- `add_input` re-copies an input whose recorded file is missing, replaced, or forged (same
+  handle id), repairs entries planted under `inputs/`, and bounds host-path copies. Sandboxed
+  code can no longer create input records.
+- **Behavior change:** a repeat `add_input` with the same `input_id` but different bytes now
+  stores the host's new bytes (same handle id); with the same bytes it is still a no-copy
+  no-op.
+- `aadd_input` copies in a worker thread.
+- Sandbox `publish()` requires the `deliver` bundle (`Session.create(..., bundles=None)` keeps
+  the previous behavior for direct callers).
+- `build_timeout_s` is one budget for the image build and pip layer; a timed-out pip-layer
+  container is removed.
+
 ### Ingesting user files
 - New `Conversation.add_input` / `aadd_input` / `inputs` (and `Session.add_input` /
   `Session.inputs`): uploads become read-only `binary` handles under `inputs/<input_id>/`,
