@@ -25,6 +25,10 @@ class FetchConfig:
     max_bytes: int = 10_000_000
     timeout_s: float = 30.0
     allowed_schemes: tuple[str, ...] = ("http", "https")
+    # Hostnames or CIDRs exempted from the internal-address denylist. Empty by default:
+    # internal data sources are a legitimate use case, but they must be named explicitly.
+    allow_private_hosts: tuple[str, ...] = ()
+    max_redirects: int = 5
 
 
 @dataclass
