@@ -28,3 +28,6 @@ wheels/
 evals/runs/
 evals/results/
 evals/run.log
+
+# Local agent conventions (not a project deliverable)
+CLAUDE.md

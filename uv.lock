@@ -2709,8 +2709,7 @@ wheels = [
 ]
 
 [[package]]
-name = "tether"
-version = "0.1.0"
+name = "tether-harness"
 source = { editable = "." }
 dependencies = [
     { name = "agent-framework-core" },
@@ -2748,7 +2747,7 @@ requires-dist = [
     { name = "pyarrow", specifier = ">=15.0" },
     { name = "trafilatura", specifier = ">=2.0.0" },
 ]
-provides-extras = ["docling", "agui"]
+provides-extras = ["agui", "docling"]
 
 [package.metadata.requires-dev]
 dev = [
