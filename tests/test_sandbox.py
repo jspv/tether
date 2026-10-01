@@ -271,27 +271,30 @@ def test_last_expression_can_load_a_handle(tmp_path):
 
 
 def test_child_record_carries_no_metadata(tmp_path):
-    """The child reports id/kind/path/source and nothing else."""
+    # Assert what the CHILD wrote, not what the parent passed on: the parent hard-codes
+    # the four kwargs, so spying on adopt() proves nothing about the child.
     sb, store = _sandbox(tmp_path)
-    captured: list[dict] = []
-    real_adopt = store.adopt
+    captured = []
+    original_ingest = type(sb)._ingest_new_handles
 
-    def spy(**kw):
-        captured.append(kw)
-        return real_adopt(**kw)
+    def spy(self, new_handles_file):
+        for line in new_handles_file.read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                captured.append(json.loads(line))
+        return original_ingest(self, new_handles_file)
 
-    store.adopt = spy
-    res = sb.run_code(
-        "import pandas as pd\n"
-        "from tether_sandbox import save\n"
-        "save('h1', pd.DataFrame({'a': [1, 2, 3]}))\n"
-    )
+    type(sb)._ingest_new_handles = spy
+    try:
+        res = sb.run_code(
+            "import pandas as pd\n"
+            "from tether_sandbox import save\n"
+            "save('h1', pd.DataFrame({'a': [1, 2, 3]}))\n")
+    finally:
+        type(sb)._ingest_new_handles = original_ingest
+
     assert res.error is None, res.error
-    assert res.new_handles == ["h1"]
-    assert [set(kw) for kw in captured] == [{"id", "kind", "path", "source"}]
-    # metadata came from the parent, computed from the file
-    assert store.summary("h1")["n_rows"] == 3
-    assert store.summary("h1")["schema"] == {"a": "int64"}
+    assert [set(rec) for rec in captured] == [{"id", "kind", "path", "source"}]
+    assert store.summary("h1")["n_rows"] == 3      # parent still derived the truth
 
 
 def test_forged_child_metadata_is_overridden(tmp_path):
@@ -356,13 +359,17 @@ def _tiny_limits_sandbox(tmp_path, **kw):
 
 def test_oversized_emit_is_rejected_not_parsed(tmp_path):
     sb, _ = _tiny_limits_sandbox(tmp_path)
-    res = sb.run_code("from tether_sandbox import emit\nemit('x' * 50_000)\n")
+    # Invalid JSON: only passes if the size check runs before parsing.
+    res = sb.run_code(
+        "import os\n"
+        "open(os.environ['TETHER_EMIT'], 'w').write('{' * 50_000)\n")
     assert res.result is None
-    assert "emit payload too large" in res.error
+    assert "emit payload too large" in (res.error or "")
+    assert "malformed" not in res.error
 
 
 def test_new_handles_record_count_is_capped(tmp_path):
-    sb, _ = _tiny_limits_sandbox(tmp_path)
+    sb, _ = _tiny_limits_sandbox(tmp_path, max_control_bytes=1024 * 1024)
     res = sb.run_code(
         "from tether_sandbox import save\n"
         "for i in range(10):\n"
@@ -429,3 +436,56 @@ def test_adopt_raises_a_typed_error_on_id_reuse(tmp_path):
     with pytest.raises(HandleIdReuseError):
         store.adopt(id=h.id, kind="text", path="handles/x.txt", source="s")
     assert issubclass(HandleIdReuseError, ValueError)
+
+
+def test_id_reuse_reporting_is_bounded(tmp_path):
+    # Surfacing rejections must not itself become a flood channel: the error string
+    # cannot grow with the number of rejected records.
+    sb, store = _sandbox(tmp_path)
+    original = store.put({"trusted": True}, source="parent")
+    res = sb.run_code(
+        "import json, os\n"
+        "open(os.path.join('handles', 'e.txt'), 'w').write('x')\n"
+        f"rec = json.dumps({{'id': {original.id!r}, 'kind': 'text',\n"
+        "                   'path': 'handles/e.txt', 'source': 'run_python'})\n"
+        "f = open(os.environ['TETHER_NEW_HANDLES'], 'a')\n"
+        "for _ in range(5000):\n"
+        "    f.write(rec + '\\n')\n"
+        "f.close()\n")
+    assert res.new_handles == []
+    assert "5000" in (res.error or "")        # the count is reported
+    assert len(res.error) < 1000              # but the message stays small
+
+
+def test_id_reuse_reporting_bounds_distinct_and_long_ids(tmp_path):
+    sb, store = _sandbox(tmp_path)
+    for i in range(10):
+        store.put({"i": i}, source="parent", id=f"{'x' * 100}{i}")
+    res = sb.run_code(
+        "import json, os\n"
+        "open(os.path.join('handles', 'e.txt'), 'w').write('x')\n"
+        "f = open(os.environ['TETHER_NEW_HANDLES'], 'a')\n"
+        "for i in range(10):\n"
+        "    f.write(json.dumps({'id': 'x' * 100 + str(i), 'kind': 'text',\n"
+        "                        'path': 'handles/e.txt', 'source': 's'}) + '\\n')\n"
+        "f.close()\n")
+    assert "10" in res.error
+    assert len(res.error) < 1000
+
+
+def test_session_create_carries_config_caps_into_sandbox(tmp_path):
+    from tether.config import TetherConfig
+    from tether.session import Session
+
+    cfg = TetherConfig(root_dir=tmp_path / "s", max_emit_bytes=11, max_control_bytes=22,
+                       max_new_handles=3)
+    lim = Session.create(cfg).sandbox.limits
+    assert (lim.max_emit_bytes, lim.max_control_bytes, lim.max_new_handles) == (11, 22, 3)
+
+
+def test_container_sandbox_stores_limits(tmp_path):
+    from tether.sandbox_container import ContainerSandbox
+
+    limits = ControlPlaneLimits(max_emit_bytes=5, max_control_bytes=6, max_new_handles=7)
+    sb = ContainerSandbox(root=tmp_path, store=None, runtime="podman", limits=limits)
+    assert sb.limits is limits

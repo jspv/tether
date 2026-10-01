@@ -20,6 +20,10 @@ class HandleIdReuseError(ValueError):
     ingestion catches it by type to report it rather than silently skipping.
     """
 
+    def __init__(self, handle_id: str) -> None:
+        super().__init__(f"handle id {handle_id!r} already exists; handles are immutable")
+        self.handle_id = handle_id
+
 
 @dataclass
 class Handle:
@@ -210,7 +214,7 @@ class HandleStore:
         the record for a handle the child did not create cannot be repointed.
         """
         if id in self._handles:
-            raise HandleIdReuseError(f"handle id {id!r} already exists; handles are immutable")
+            raise HandleIdReuseError(id)
         describer = self._DESCRIBERS.get(kind)
         if describer is None:
             raise ValueError(f"unknown handle kind: {kind!r}")

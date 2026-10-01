@@ -25,6 +25,8 @@ from .paths import safe_path
 _RUNTIME_DIR = Path(__file__).resolve().parent / "runtime"
 _RUNNER = _RUNTIME_DIR / "_runner.py"
 _SCRIPTS_DIR = ".scripts"
+_MAX_REPORTED_IDS = 5   # distinct rejected ids named in an error message
+_MAX_REPORTED_ID_LEN = 64
 
 
 @dataclass
@@ -173,7 +175,8 @@ class _OrchestratedSandbox:
         if size > self.limits.max_control_bytes:
             return ids, (f"tether: control file too large ({size} bytes > "
                          f"{self.limits.max_control_bytes}); no handles ingested")
-        reused: list[str] = []
+        reused: dict[str, None] = {}   # distinct rejected ids, insertion-ordered
+        reused_count = 0
         cap_error: str | None = None
         for line in new_handles_file.read_text(encoding="utf-8").splitlines():
             line = line.strip()
@@ -189,12 +192,19 @@ class _OrchestratedSandbox:
                                           path=rec["path"], source=rec.get("source", "run_python"))
                 ids.append(handle.id)
             except HandleIdReuseError as e:
-                reused.append(str(e))
+                reused_count += 1
+                if len(reused) <= _MAX_REPORTED_IDS:  # stop tracking once past the display cap
+                    reused[str(e.handle_id)[:_MAX_REPORTED_ID_LEN]] = None
             except (json.JSONDecodeError, ValueError, KeyError, TypeError):
                 continue
         parts = []
-        if reused:
-            parts.append("tether: save rejected, " + "; ".join(reused))
+        if reused_count:
+            shown = list(reused)[:_MAX_REPORTED_IDS]
+            more = ", ..." if len(reused) > _MAX_REPORTED_IDS else ""
+            # Bounded by construction: the length cannot grow with the number of records.
+            parts.append(f"tether: save rejected for {reused_count} record(s): handle id "
+                         f"already exists and handles are immutable; ids: "
+                         f"{', '.join(shown)}{more}")
         if cap_error:
             parts.append(cap_error)
         return ids, "\n".join(parts) or None
