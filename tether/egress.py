@@ -2,7 +2,8 @@
 
 The model chooses the URLs this project fetches, and fetched content is itself untrusted,
 so egress is a model-controlled capability. This module denies the internal address space
-by default and re-validates every redirect hop, so a 302 cannot walk a request inward.
+and cloud instance-metadata endpoints by default. Metadata endpoints are checked
+unconditionally and cannot be overridden by the allowlist.
 
 Known residual risk: validation resolves the hostname and then hands the URL to httpx,
 which resolves it again -- a DNS entry that changes in between (rebinding) is not caught.
@@ -23,7 +24,19 @@ from .config import FetchConfig
 # reserved, or otherwise special, yet it is routinely routable inside cloud and carrier
 # networks. Every other special-use range is already covered by the flag checks below.
 _EXTRA_DENIED_NETS = (ipaddress.ip_network("100.64.0.0/10"),)
-_METADATA_IPS = frozenset({"169.254.169.254", "fd00:ec2::254"})
+
+# Cloud instance-metadata endpoints. Never a legitimate data source, and reaching one
+# usually means credential theft. These are denied unconditionally, regardless of allowlist
+# configuration. Allowlisting a hostname vouches for the name, not for whatever it resolves
+# to later.
+_METADATA_ADDRS = frozenset(ipaddress.ip_address(a) for a in (
+    "169.254.169.254",   # AWS / GCP / Azure IMDS, OpenStack, and most others
+    "169.254.170.2",     # AWS ECS task credentials
+    "168.63.129.16",     # Azure wireserver -- a PUBLIC address, denied by nothing else
+    "100.100.100.200",   # Alibaba Cloud (inside the CGNAT range)
+    "192.0.0.192",       # Oracle Cloud
+    "fd00:ec2::254",     # AWS IMDS over IPv6
+))
 
 
 class BlockedAddressError(ValueError):
@@ -34,9 +47,17 @@ def _resolve(host: str) -> list[str]:
     return [info[4][0] for info in socket.getaddrinfo(host, None)]
 
 
+def _is_metadata(addr: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    """Cloud instance-metadata endpoints. Never a legitimate data source, and reaching one
+    usually means credential theft -- so these are denied unconditionally, ahead of the
+    allowlist. Allowlisting a hostname vouches for the name, not for whatever it may
+    resolve to later.
+    """
+    mapped = getattr(addr, "ipv4_mapped", None)
+    return (mapped or addr) in _METADATA_ADDRS
+
+
 def _is_denied(addr: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
-    if str(addr) in _METADATA_IPS:
-        return True
     if any(addr in net for net in _EXTRA_DENIED_NETS):
         return True
     return bool(addr.is_loopback or addr.is_private or addr.is_link_local
@@ -74,13 +95,17 @@ def validate_url(url: str, cfg: FetchConfig, *,
         resolver = resolve or _resolve
         try:
             addrs = resolver(host)
-        except OSError as e:
+        except (OSError, UnicodeError) as e:
             raise BlockedAddressError(f"could not resolve host {host!r}: {e}") from e
         if not addrs:
             raise BlockedAddressError(f"could not resolve host {host!r}: no addresses")
 
     for raw in addrs:
         addr = ipaddress.ip_address(raw)
+        # Metadata endpoints are checked unconditionally, before allowlist.
+        if _is_metadata(addr):
+            raise BlockedAddressError(
+                f"blocked cloud metadata endpoint {raw} for host {host!r}")
         if _is_denied(addr) and not _allowed_by_config(host, addr, cfg):
             raise BlockedAddressError(
                 f"blocked internal address {raw} for host {host!r}; add the host or its "
