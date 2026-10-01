@@ -236,3 +236,21 @@ def test_local_tier_emits_no_isolation_warning(tmp_path):
     store = HandleStore(tmp_path / "r")
     with pytest.warns(NoSandboxIsolationWarning, match="NO isolation"):
         _build_sandbox(tmp_path / "r", store, SandboxConfig(backend="local"))
+
+
+def test_constructor_runtimeerror_is_not_relabelled_as_a_missing_runtime(tmp_path, monkeypatch):
+    """Only the probe's RuntimeErrors mean 'no usable runtime'. A future RuntimeError from
+    ContainerSandbox.__init__ must not send the user off to install something they have."""
+    monkeypatch.setattr("tether.container_runtime.require_usable_runtime",
+                        lambda override: "podman")
+
+    def boom(**kw):
+        raise RuntimeError("bind mount setup failed")
+
+    monkeypatch.setattr("tether.sandbox_container.ContainerSandbox", boom)
+    store = HandleStore(tmp_path / "r")
+
+    with pytest.raises(RuntimeError) as excinfo:
+        _build_sandbox(tmp_path / "r", store, SandboxConfig(backend="container"))
+    assert not isinstance(excinfo.value, SandboxRuntimeUnavailable)
+    assert "bind mount setup failed" in str(excinfo.value)

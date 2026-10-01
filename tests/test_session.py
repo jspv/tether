@@ -139,3 +139,45 @@ def test_session_unbinds_bus_on_exit(tmp_path):
         assert current_bus() is None
 
     asyncio.run(run())
+
+
+def test_failed_sandbox_build_leaves_no_orphan_session_dir(tmp_path, monkeypatch):
+    """Session.create used to mkdir the root before _build_sandbox could refuse, so every
+    failed start on a runtime-less host left an empty .tether/sessions/N behind."""
+    import pytest
+
+    from tether.config import TetherConfig
+    from tether.sandbox import SandboxRuntimeUnavailable
+    from tether.session import Session
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("tether.session._build_sandbox",
+                        lambda *a, **kw: (_ for _ in ()).throw(
+                            SandboxRuntimeUnavailable("no runtime")))
+
+    for _ in range(3):
+        with pytest.raises(SandboxRuntimeUnavailable):
+            Session.create(TetherConfig())
+
+    sessions = tmp_path / ".tether" / "sessions"
+    assert [p.name for p in sessions.iterdir()] == []
+
+
+def test_a_pre_existing_pinned_root_survives_a_failed_build(tmp_path, monkeypatch):
+    """Cleanup removes only a root this call created -- never the user's own directory."""
+    import pytest
+
+    from tether.config import TetherConfig
+    from tether.sandbox import SandboxRuntimeUnavailable
+    from tether.session import Session
+
+    root = tmp_path / "mine"
+    root.mkdir()
+    (root / "keepme.txt").write_text("precious", encoding="utf-8")
+    monkeypatch.setattr("tether.session._build_sandbox",
+                        lambda *a, **kw: (_ for _ in ()).throw(
+                            SandboxRuntimeUnavailable("no runtime")))
+
+    with pytest.raises(SandboxRuntimeUnavailable):
+        Session.create(TetherConfig(root_dir=root))
+    assert (root / "keepme.txt").read_text() == "precious"

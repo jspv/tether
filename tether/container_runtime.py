@@ -27,10 +27,11 @@ def detect_runtime(override: str | None, which: Callable[[str], str | None] = sh
     for candidate in ("podman", "docker"):
         if which(candidate):
             return candidate
-    raise RuntimeError(
-        "no container runtime found: install podman or docker, or set "
-        "TetherConfig.sandbox.backend='local'"
-    )
+    # Facts only. The caller that selected the container backend owns the remediation --
+    # see Session._build_sandbox, which wraps this. Repeating "install podman or docker, or
+    # set backend='local'" here made the user read the same advice twice, in two different
+    # spellings, in one error.
+    raise RuntimeError("no container runtime found: neither podman nor docker is on PATH")
 
 
 def require_usable_runtime(override: str | None, run: Callable = subprocess.run) -> str:

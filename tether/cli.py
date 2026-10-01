@@ -9,6 +9,7 @@ from typing import Callable
 
 from .api import Tether
 from .config import TetherConfig
+from .sandbox import SandboxRuntimeUnavailable
 from .status import StatusEvent
 
 
@@ -54,4 +55,15 @@ def run_cli(argv: list[str] | None = None, client=None) -> int:
 
 
 def main() -> None:
-    raise SystemExit(run_cli())
+    """Console-script entry. Exit 2 on an unusable sandbox, with the message, not a traceback.
+
+    ``SandboxRuntimeUnavailable`` is a configuration problem with a remedy spelled out in
+    its message (install a runtime, or opt into the local tier). A stack trace buries that
+    and reads like a crash in the harness.
+    """
+    try:
+        code = run_cli()
+    except SandboxRuntimeUnavailable as e:
+        print(str(e), file=sys.stderr)
+        code = 2
+    raise SystemExit(code)

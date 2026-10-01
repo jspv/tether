@@ -36,3 +36,48 @@ def test_cli_prints_answer_and_session(tmp_path, capsys):
     assert code == 0
     assert "all done" in out
     assert "[session:" in out
+
+
+def test_main_prints_the_message_and_exits_2_without_a_runtime(monkeypatch, capsys):
+    """The plan's bar: not a traceback, and not a silent local run."""
+    import pytest
+
+    from tether.sandbox import SandboxRuntimeUnavailable
+
+    def unavailable(*a, **kw):
+        raise SandboxRuntimeUnavailable("no container runtime found: ...\n\nrun_python ...")
+
+    monkeypatch.setattr("tether.cli.run_cli", unavailable)
+    from tether.cli import main
+
+    with pytest.raises(SystemExit) as excinfo:
+        main()
+    assert excinfo.value.code == 2
+    captured = capsys.readouterr()
+    assert "no container runtime found" in captured.err
+    assert "Traceback" not in captured.err
+    assert captured.out == ""
+
+
+def test_runtime_unavailable_message_states_the_opt_out_once(tmp_path, monkeypatch):
+    """detect_runtime used to repeat the wrapper's advice in a different spelling, so the
+    user read 'install podman or docker ... set backend local' twice in one error."""
+    import pytest
+
+    from tether.config import SandboxConfig
+    from tether.handles import HandleStore
+    from tether.sandbox import SandboxRuntimeUnavailable
+    from tether.session import _build_sandbox
+
+    monkeypatch.setattr("tether.container_runtime.detect_runtime",
+                        lambda override, which=None: (_ for _ in ()).throw(
+                            RuntimeError("no container runtime found: neither podman nor "
+                                         "docker is on PATH")))
+    store = HandleStore(tmp_path / "r")
+    with pytest.raises(SandboxRuntimeUnavailable) as excinfo:
+        _build_sandbox(tmp_path / "r", store, SandboxConfig(backend="container"))
+
+    message = str(excinfo.value).lower()
+    assert message.count("podman") == 1          # named by the probe, not again by the wrapper
+    assert message.count("local") == 2           # the opt-out, and its env-var spelling
+    assert "no isolation" in message

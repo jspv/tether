@@ -31,12 +31,24 @@ class Session:
     @classmethod
     def create(cls, config: TetherConfig) -> "Session":
         root = _resolve_root(config)
+        # The root has to exist before the HandleStore, which has to exist before the
+        # sandbox -- so it cannot simply be created last. Instead, a root this call brought
+        # into being is removed again if anything downstream fails. Without that, every
+        # failed start on a machine with no container runtime left an empty
+        # .tether/sessions/N behind, one per attempt. A root that already existed (a pinned
+        # root_dir, a resumed thread) is never touched: it is not ours to delete.
+        pre_existing = root.exists()
         root.mkdir(parents=True, exist_ok=True)
-        store = HandleStore(root)
-        limits = ControlPlaneLimits(max_emit_bytes=config.max_emit_bytes,
-                                    max_control_bytes=config.max_control_bytes,
-                                    max_new_handles=config.max_new_handles)
-        sandbox = _build_sandbox(root, store, config.sandbox, limits)
+        try:
+            store = HandleStore(root)
+            limits = ControlPlaneLimits(max_emit_bytes=config.max_emit_bytes,
+                                        max_control_bytes=config.max_control_bytes,
+                                        max_new_handles=config.max_new_handles)
+            sandbox = _build_sandbox(root, store, config.sandbox, limits)
+        except BaseException:
+            if not pre_existing:
+                shutil.rmtree(root, ignore_errors=True)
+            raise
         return cls(root=root, store=store, sandbox=sandbox, config=config)
 
     @property
@@ -191,14 +203,21 @@ def _build_sandbox(root: Path, store: HandleStore, sandbox_config: SandboxConfig
             # That is the most common failure mode -- especially on macOS, where the runtime
             # lives in a Linux VM -- and it is exactly the case this message exists to serve.
             container_runtime.require_usable_runtime(sandbox_config.container_runtime)
-            return ContainerSandbox(root=root, store=store, config=sandbox_config,
-                                    limits=limits)
         except RuntimeError as e:
+            # One coherent message: the probe states the specific fault (not on PATH, or
+            # installed but not responding, with its own `machine start` hint), and this
+            # adds only what the probe cannot know -- why container is the default, and the
+            # exact opt-out. Neither half repeats the other.
             raise SandboxRuntimeUnavailable(
-                f"{e}\nThe container backend is the default because run_python executes "
-                f'model-authored code. Install podman or docker, or set '
-                f'TetherConfig.sandbox.backend = "local" to run it with no isolation.'
+                f"{e}\n\nrun_python executes model-authored code, which is why the "
+                f"container backend is the default. Install and start a runtime, or set "
+                f'TetherConfig.sandbox.backend = "local" (or TETHER_SANDBOX_BACKEND=local) '
+                f"to run it with no isolation."
             ) from e
+        # Deliberately outside the try: only the probe's RuntimeErrors mean "no usable
+        # runtime". A RuntimeError from the constructor is a different bug and must not be
+        # relabelled as a missing runtime, sending the user to install something they have.
+        return ContainerSandbox(root=root, store=store, config=sandbox_config, limits=limits)
     if sandbox_config.backend != "local":
         raise ValueError(
             f"unknown sandbox backend {sandbox_config.backend!r}; expected 'container' "
