@@ -29,3 +29,10 @@ def test_nested_configs_are_independent_between_instances():
     a = TetherConfig()
     b = TetherConfig()
     assert a.sandbox is not b.sandbox  # field(default_factory=...) not shared
+
+
+def test_control_plane_caps_have_defaults():
+    cfg = TetherConfig()
+    assert cfg.max_emit_bytes == 1024 * 1024
+    assert cfg.max_control_bytes == 8 * 1024 * 1024
+    assert cfg.max_new_handles == 256

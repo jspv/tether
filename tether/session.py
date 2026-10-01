@@ -10,7 +10,7 @@ from typing import Any, Callable
 from . import bundles as _bundles
 from .config import TetherConfig, SandboxConfig
 from .handles import HandleStore
-from .sandbox import LocalSubprocessSandbox, SandboxExecutor
+from .sandbox import ControlPlaneLimits, LocalSubprocessSandbox, SandboxExecutor
 from .status import StatusBus, StatusEvent, bind_bus
 
 
@@ -29,7 +29,10 @@ class Session:
         root = _resolve_root(config)
         root.mkdir(parents=True, exist_ok=True)
         store = HandleStore(root)
-        sandbox = _build_sandbox(root, store, config.sandbox)
+        limits = ControlPlaneLimits(max_emit_bytes=config.max_emit_bytes,
+                                    max_control_bytes=config.max_control_bytes,
+                                    max_new_handles=config.max_new_handles)
+        sandbox = _build_sandbox(root, store, config.sandbox, limits)
         return cls(root=root, store=store, sandbox=sandbox, config=config)
 
     @property
@@ -166,10 +169,10 @@ def _resolve_root(config: TetherConfig) -> Path:
     return (base / str(next_id)).resolve()
 
 
-def _build_sandbox(root: Path, store: HandleStore,
-                   sandbox_config: SandboxConfig) -> SandboxExecutor:
+def _build_sandbox(root: Path, store: HandleStore, sandbox_config: SandboxConfig,
+                   limits: ControlPlaneLimits | None = None) -> SandboxExecutor:
     """Pick the sandbox backend from config (default: local)."""
     if sandbox_config.backend == "container":
         from .sandbox_container import ContainerSandbox  # local import: optional backend
-        return ContainerSandbox(root=root, store=store, config=sandbox_config)
-    return LocalSubprocessSandbox(root=root, store=store, config=sandbox_config)
+        return ContainerSandbox(root=root, store=store, config=sandbox_config, limits=limits)
+    return LocalSubprocessSandbox(root=root, store=store, config=sandbox_config, limits=limits)

@@ -50,6 +50,11 @@ class TetherConfig:
     max_spill_bytes: int = 100 * 1024 * 1024   # upper edge: a return over this is rejected, not stored
     max_context_window_tokens: int = 128_000
     max_output_tokens: int = 4096
+    # Control-plane bounds (parent <-> sandbox channel). These live here rather than on
+    # SandboxConfig because they bound the orchestration channel, not a backend's behavior.
+    max_emit_bytes: int = 1024 * 1024          # emit payload cap, checked before parsing
+    max_control_bytes: int = 8 * 1024 * 1024   # new-handles file read cap
+    max_new_handles: int = 256                 # records adopted per run
     root_dir: Path | None = None  # None -> a session dir is created under ./.tether/sessions/
     cleanup: bool = False  # delete the root on async-context exit (throwaway runs)
     idle_ttl_s: float | None = None  # continuous-session idle TTL (None = never expire)

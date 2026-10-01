@@ -82,7 +82,7 @@ import pytest
 
 from tether.config import SandboxConfig
 from tether.handles import HandleStore
-from tether.sandbox import ExecResult, LocalSubprocessSandbox
+from tether.sandbox import ControlPlaneLimits, ExecResult, LocalSubprocessSandbox
 from tether.paths import PathEscapesRootError
 
 
@@ -270,32 +270,17 @@ def test_last_expression_can_load_a_handle(tmp_path):
     assert res.result == 6
 
 
-def test_dataframe_preview_matches_between_parent_and_child(tmp_path):
-    # The child's save() duplicates HandleStore's dataframe preview logic; they must
-    # produce an identical preview for the same frame (guards against contract drift).
-    import pandas as pd
-
-    df = pd.DataFrame({"a": list(range(10))})  # >5 rows -> truncation suffix expected
-
-    parent_store = HandleStore(tmp_path / "p")
-    parent_handle = parent_store.put(df, source="s")
-
-    child_store = HandleStore(tmp_path / "c")
-    sb = LocalSubprocessSandbox(root=tmp_path / "c", store=child_store, config=SandboxConfig())
-    child_store.put(df, source="seed", id="hin")
-    (tmp_path / "c" / "s.py").write_text(
-        "from tether_sandbox import load, save\nsave('hout', load('hin'))\n"
-    )
-    sb.run_script("s.py")
-    child_handle = child_store.manifest_handles()["hout"]
-
-    assert child_handle.preview == parent_handle.preview
-    assert "5 of 10 rows" in child_handle.preview  # suffix present on both sides
-
-
 def test_child_record_carries_no_metadata(tmp_path):
     """The child reports id/kind/path/source and nothing else."""
     sb, store = _sandbox(tmp_path)
+    captured: list[dict] = []
+    real_adopt = store.adopt
+
+    def spy(**kw):
+        captured.append(kw)
+        return real_adopt(**kw)
+
+    store.adopt = spy
     res = sb.run_code(
         "import pandas as pd\n"
         "from tether_sandbox import save\n"
@@ -303,6 +288,7 @@ def test_child_record_carries_no_metadata(tmp_path):
     )
     assert res.error is None, res.error
     assert res.new_handles == ["h1"]
+    assert [set(kw) for kw in captured] == [{"id", "kind", "path", "source"}]
     # metadata came from the parent, computed from the file
     assert store.summary("h1")["n_rows"] == 3
     assert store.summary("h1")["schema"] == {"a": "int64"}
@@ -329,7 +315,7 @@ def test_forged_child_metadata_is_overridden(tmp_path):
 
 
 def test_child_cannot_repoint_an_existing_handle(tmp_path):
-    """Adopting an existing id is refused; ingestion stays tolerant and continues."""
+    """Adopting an existing id is refused (and reported); ingestion stays tolerant."""
     sb, store = _sandbox(tmp_path)
     original = store.put({"trusted": True}, source="parent")
     res = sb.run_code(
@@ -339,7 +325,7 @@ def test_child_cannot_repoint_an_existing_handle(tmp_path):
         "open(os.path.join('handles', 'evil.txt'), 'w').write('attacker data')\n"
         "open(os.environ['TETHER_NEW_HANDLES'], 'a').write(json.dumps(rec) + '\\n')\n"
     )
-    assert res.error is None, res.error
+    assert "already exists" in (res.error or "")                   # refused and surfaced
     assert res.new_handles == []                                  # rejected
     assert store.summary(original.id) == original.summary()       # untouched
 
@@ -355,4 +341,66 @@ def test_one_corrupt_record_does_not_abort_ingestion(tmp_path):
         "                    'source': 'run_python'}) + '\\n')\n"
         "f.close()\n"
     )
+    assert res.error is None, res.error
     assert res.new_handles == ["h1"]
+
+
+def _tiny_limits_sandbox(tmp_path, **kw):
+    root = tmp_path / "r"
+    store = HandleStore(root)
+    limits = ControlPlaneLimits(**{"max_emit_bytes": 1024, "max_control_bytes": 1024,
+                                   "max_new_handles": 2, **kw})
+    return LocalSubprocessSandbox(root=root, store=store, config=SandboxConfig(),
+                                  limits=limits), store
+
+
+def test_oversized_emit_is_rejected_not_parsed(tmp_path):
+    sb, _ = _tiny_limits_sandbox(tmp_path)
+    res = sb.run_code("from tether_sandbox import emit\nemit('x' * 50_000)\n")
+    assert res.result is None
+    assert "emit payload too large" in res.error
+
+
+def test_new_handles_record_count_is_capped(tmp_path):
+    sb, _ = _tiny_limits_sandbox(tmp_path)
+    res = sb.run_code(
+        "from tether_sandbox import save\n"
+        "for i in range(10):\n"
+        "    save(f'h{i}', {'i': i})\n"
+    )
+    assert len(res.new_handles) == 2                 # max_new_handles
+    assert "too many new handles" in (res.error or "")
+
+
+def test_oversized_new_handles_file_is_bounded(tmp_path):
+    sb, _ = _tiny_limits_sandbox(tmp_path, max_new_handles=1000)
+    res = sb.run_code(
+        "import os\n"
+        "open(os.environ['TETHER_NEW_HANDLES'], 'a').write('x' * 20_000)\n"
+    )
+    assert "control file too large" in (res.error or "")
+
+
+def test_resaving_an_existing_id_raises_in_the_child(tmp_path):
+    # Honest code must fail loudly at the point of the mistake, not believe it succeeded.
+    sb, store = _sandbox(tmp_path)
+    sb.run_code("from tether_sandbox import save\nsave('h1', {'v': 1})\n")
+    res = sb.run_code("from tether_sandbox import save\nsave('h1', {'v': 2})\n")
+    assert res.exit_code != 0
+    assert "already exists" in (res.error or "")
+
+
+def test_id_reuse_rejection_is_reported_not_silent(tmp_path):
+    # The parent is the boundary: a hand-written control record reusing an id is refused
+    # AND surfaced, so stale metadata can never sit silently over changed bytes.
+    sb, store = _sandbox(tmp_path)
+    original = store.put({"trusted": True}, source="parent")
+    res = sb.run_code(
+        "import json, os\n"
+        "open(os.path.join('handles', 'evil.txt'), 'w').write('attacker data')\n"
+        f"rec = {{'id': {original.id!r}, 'kind': 'text', 'path': 'handles/evil.txt',\n"
+        "       'source': 'run_python'}\n"
+        "open(os.environ['TETHER_NEW_HANDLES'], 'a').write(json.dumps(rec) + '\\n')\n")
+    assert res.new_handles == []
+    assert "already exists" in (res.error or "")
+    assert store.summary(original.id) == original.summary()

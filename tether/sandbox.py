@@ -38,6 +38,14 @@ class ExecResult:
     killed_by: str | None = None
 
 
+@dataclass
+class ControlPlaneLimits:
+    """Bounds on the parent<->child control channel. Defaults mirror TetherConfig."""
+    max_emit_bytes: int = 1024 * 1024
+    max_control_bytes: int = 8 * 1024 * 1024
+    max_new_handles: int = 256
+
+
 class SandboxExecutor(Protocol):
     """Swappable execution backend. Local now; container/remote later."""
 
@@ -75,10 +83,12 @@ class _OrchestratedSandbox:
     """
 
     def __init__(self, root: Path | str, store: HandleStore,
-                 config: SandboxConfig | None = None) -> None:
+                 config: SandboxConfig | None = None,
+                 limits: ControlPlaneLimits | None = None) -> None:
         self.root = Path(root).resolve()
         self.store = store
         self.config = config or SandboxConfig()
+        self.limits = limits or ControlPlaneLimits()
         self._run_counter = 0
 
     def run_code(self, code: str, args: list[str] | None = None) -> ExecResult:
@@ -117,10 +127,17 @@ class _OrchestratedSandbox:
             result = None
             emit_error = None
             if launched.exit_code == 0 and emit_file.exists():
-                try:
-                    result = json.loads(emit_file.read_text(encoding="utf-8"))
-                except json.JSONDecodeError as e:
-                    emit_error = f"tether: malformed emit payload: {e}"
+                size = emit_file.stat().st_size
+                if size > self.limits.max_emit_bytes:
+                    # Check the size BEFORE parsing: a hostile child must not be able to
+                    # flood context (or the parser) through the result channel.
+                    emit_error = (f"tether: emit payload too large ({size} bytes > "
+                                  f"{self.limits.max_emit_bytes}); save a handle instead")
+                else:
+                    try:
+                        result = json.loads(emit_file.read_text(encoding="utf-8"))
+                    except json.JSONDecodeError as e:
+                        emit_error = f"tether: malformed emit payload: {e}"
 
             # Ergonomic fallback: if the script neither emitted nor ended in an expression but
             # printed something, surface that so a model that just print()s an answer still gets one.
@@ -128,9 +145,9 @@ class _OrchestratedSandbox:
                     and launched.stdout.strip()):
                 result = launched.stdout.strip()
 
-            new_handles = self._ingest_new_handles(new_handles_file)
+            new_handles, ingest_error = self._ingest_new_handles(new_handles_file)
             base_error = (launched.stderr.strip() or None) if launched.exit_code != 0 else None
-            error = "\n".join(p for p in (base_error, emit_error) if p) or None
+            error = "\n".join(p for p in (base_error, emit_error, ingest_error) if p) or None
 
             return ExecResult(stdout=launched.stdout, stderr=launched.stderr, result=result,
                               error=error, exit_code=launched.exit_code,
@@ -139,29 +156,49 @@ class _OrchestratedSandbox:
             for f in (new_handles_file, emit_file, registry_file):
                 f.unlink(missing_ok=True)
 
-    def _ingest_new_handles(self, new_handles_file: Path) -> list[str]:
-        """Adopt handles the child wrote.
+    def _ingest_new_handles(self, new_handles_file: Path) -> tuple[list[str], str | None]:
+        """Adopt handles the child wrote; return (ids, error).
 
         Records are untrusted: ``adopt`` derives all metadata from the file itself and
         refuses an id that already exists. Tolerant by design -- a rejected or corrupt
-        record is skipped, not fatal, so one bad record cannot abort ingestion or leave
-        the store inconsistent.
+        record is skipped, not fatal. Two hard bounds stop a hostile child from using this
+        channel as a flood: the file is read only up to ``max_control_bytes``, and at most
+        ``max_new_handles`` records are adopted. An id-reuse rejection is reported in the
+        returned error so the model learns the save did not take effect.
         """
         ids: list[str] = []
         if not new_handles_file.exists():
-            return ids
+            return ids, None
+        size = new_handles_file.stat().st_size
+        if size > self.limits.max_control_bytes:
+            return ids, (f"tether: control file too large ({size} bytes > "
+                         f"{self.limits.max_control_bytes}); no handles ingested")
+        reused: list[str] = []
+        cap_error: str | None = None
         for line in new_handles_file.read_text(encoding="utf-8").splitlines():
             line = line.strip()
             if not line:
                 continue
+            if len(ids) >= self.limits.max_new_handles:
+                cap_error = (f"tether: too many new handles (cap "
+                             f"{self.limits.max_new_handles}); later records dropped")
+                break
             try:
                 rec = json.loads(line)
                 handle = self.store.adopt(id=rec["id"], kind=rec["kind"],
                                           path=rec["path"], source=rec.get("source", "run_python"))
                 ids.append(handle.id)
-            except (json.JSONDecodeError, ValueError, KeyError, TypeError):
+            except ValueError as e:
+                if "already exists" in str(e):
+                    reused.append(str(e))
+            except (KeyError, TypeError):
                 continue
-        return ids
+        parts = []
+        if reused:
+            parts.append("tether: save rejected, " + "; ".join(reused))
+        if cap_error:
+            parts.append(cap_error)
+        return ids, "\n".join(parts) or None
 
     def _launch(self, ctx: _RunContext) -> _LaunchResult:
         raise NotImplementedError

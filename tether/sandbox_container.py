@@ -14,15 +14,23 @@ import subprocess
 from pathlib import Path
 
 from .config import SandboxConfig
-from .sandbox import _RUNTIME_DIR, _LaunchResult, _OrchestratedSandbox, _RunContext, _as_text
+from .sandbox import (
+    _RUNTIME_DIR,
+    ControlPlaneLimits,
+    _LaunchResult,
+    _OrchestratedSandbox,
+    _RunContext,
+    _as_text,
+)
 
 _PIDS_LIMIT = 256
 
 
 class ContainerSandbox(_OrchestratedSandbox):
     def __init__(self, root: Path | str, store, config: SandboxConfig | None = None,
-                 runtime: str | None = None) -> None:
-        super().__init__(root, store, config)
+                 runtime: str | None = None,
+                 limits: ControlPlaneLimits | None = None) -> None:
+        super().__init__(root, store, config, limits)
         if runtime is not None:
             self._runtime = runtime
         else:

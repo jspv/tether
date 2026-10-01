@@ -42,6 +42,12 @@ def save(handle_id: str, obj: Any, source: str = "run_python") -> str:
     """
     import pandas as pd
 
+    if handle_id in _REGISTRY:
+        raise ValueError(
+            f"handle id {handle_id!r} already exists and handles are immutable; "
+            f"save under a new id"
+        )
+
     if isinstance(obj, pd.DataFrame):
         kind, rel = "dataframe", f"handles/{handle_id}.parquet"
         obj.to_parquet(_ROOT / rel)
