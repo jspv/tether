@@ -5,8 +5,9 @@
   `2026-05-30-web-research-capability-spec.md`.
 - **Motivation:** Self-eval (`evals/run_evals.py`) — 8/10 tasks pass, but every open-web
   research task fails (no web search; `fetch_url` returns raw HTML soup). A controlled
-  comparison (Claude Code + **haiku**, same model tier as our gpt-4o-mini) *succeeded* on
-  the pricing task, isolating the cause as **tooling, not model**.
+  comparison (a general-purpose coding agent driving a **small model** of the same tier as
+  our gpt-4o-mini) *succeeded* on the pricing task, isolating the cause as **tooling, not
+  model**.
 
 ## Goal
 
