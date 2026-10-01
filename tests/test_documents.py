@@ -130,6 +130,53 @@ def test_read_document_closes_its_client_on_every_path(tmp_path, monkeypatch):
     assert len(clients) == 1 and clients[0].is_closed
 
 
+def _stub_get(monkeypatch, content=b"%PDF-1.4 fake"):
+    monkeypatch.setattr("tether.tools.documents.guarded_get",
+                        lambda url, cfg, *, client, resolve=None:
+                        httpx.Response(200, content=content))
+
+
+def test_downloaded_documents_are_not_listed_as_artifacts(tmp_path, monkeypatch):
+    session = _session(tmp_path)
+    (session.root / "report.txt").write_text("mine", encoding="utf-8")
+    _stub_get(monkeypatch)
+    out = read_document(session, "https://example.com/a.pdf", convert=lambda s: "# md")
+    assert out["kind"] == "text"
+    assert session.artifacts == ["report.txt"]
+    assert list(session.root.glob("_documents/doc_*.pdf"))   # it really was downloaded
+
+
+def test_overlong_url_suffix_does_not_crash_and_lands_as_bin(tmp_path, monkeypatch):
+    session = _session(tmp_path)
+    _stub_get(monkeypatch)
+    seen = []
+    out = read_document(session, "https://example.com/doc." + "a" * 300,
+                        convert=lambda src: seen.append(src) or "# md")
+    assert out["kind"] == "text"
+    assert seen[0].endswith(".bin")
+
+
+def test_ordinary_suffix_is_preserved(tmp_path, monkeypatch):
+    session = _session(tmp_path)
+    _stub_get(monkeypatch)
+    seen = []
+    read_document(session, "https://example.com/a/b.docx?x=1",
+                  convert=lambda src: seen.append(src) or "# md")
+    assert seen[0].endswith(".docx")
+
+
+def test_filesystem_failure_during_download_is_a_structured_error(tmp_path, monkeypatch):
+    session = _session(tmp_path)
+    _stub_get(monkeypatch)
+
+    def boom(*a, **kw):
+        raise OSError("disk full")
+
+    monkeypatch.setattr("tether.tools.documents.tempfile.mkstemp", boom)
+    out = read_document(session, "https://example.com/a.pdf", convert=lambda s: "")
+    assert "could not store" in out["error"]
+
+
 def test_path_escape_returns_structured_error(tmp_path):
     sess = _session(tmp_path)
     out = read_document(sess, "../../etc/passwd", convert=lambda src: "nope")

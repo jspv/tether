@@ -14,6 +14,7 @@ seam is injectable so unit tests never need real Docling (heavy, downloads model
 from __future__ import annotations
 
 import os
+import re
 import tempfile
 from pathlib import Path
 from typing import Callable
@@ -51,6 +52,21 @@ def _docling_convert(source: str, ocr: bool = False) -> str:
     return converter.convert(source).document.export_to_markdown()
 
 
+_SAFE_SUFFIX = re.compile(r"^\.[A-Za-z0-9]{1,8}$")
+
+
+def _safe_suffix(url: str) -> str:
+    """A short alphanumeric extension, so Docling can infer the format.
+
+    The URL is model-controlled, so the suffix is allowlisted rather than sanitised:
+    an overlong one makes mkstemp raise OSError, which would escape this tool's
+    structured-error contract. Path.suffix cannot contain a separator, so traversal
+    is not a concern here -- length and character class are.
+    """
+    suffix = Path(urlparse(url).path).suffix
+    return suffix if _SAFE_SUFFIX.match(suffix) else ".bin"
+
+
 def _download(session: Session, url: str) -> Path:
     """Fetch ``url`` through the egress guard into the session root; return the local path.
 
@@ -58,8 +74,8 @@ def _download(session: Session, url: str) -> Path:
     a dedicated subdirectory so downloads are not mistaken for user artifacts.
     """
     cfg = session.config.fetch
-    suffix = Path(urlparse(url).path).suffix or ".bin"
-    dest_dir = session.root / ".documents"
+    suffix = _safe_suffix(url)
+    dest_dir = session.root / "_documents"
     dest_dir.mkdir(exist_ok=True)
 
     client = httpx.Client(timeout=cfg.timeout_s, follow_redirects=False,
@@ -96,6 +112,8 @@ def read_document(session: Session, source: str,
             return {"error": f"blocked by egress policy: {e}", "source": source}
         except httpx.HTTPError as e:
             return {"error": f"could not download {source!r}: {e}", "source": source}
+        except OSError as e:
+            return {"error": f"could not store {source!r}: {e}", "source": source}
         target = str(downloaded)
     elif scheme == "":
         try:
