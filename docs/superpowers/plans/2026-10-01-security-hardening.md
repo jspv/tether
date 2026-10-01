@@ -30,7 +30,8 @@ flips to `container` with a loud failure when no runtime exists.
   (`pyarrow`, `httpx`, `pandas` are all existing).
 - Run tests with `uv run pytest`; lint with `uv run ruff check .`. The suite must stay
   **offline** — no network, no model, no container runtime required. Baseline before starting:
-  **248 passed, 6 skipped**.
+  **242 passed, 6 skipped** (248 collected). Report passed/skipped separately; the
+  often-quoted "248" is the collected total, not the pass count.
 - Live tests stay gated behind `TETHER_LIVE=1`; container tests stay gated on a runtime
   being present.
 - `safe_path` (`tether/paths.py`) is **not modified** by this plan. It is already correct.
