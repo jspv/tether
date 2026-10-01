@@ -127,13 +127,14 @@ def guarded_get(url: str, cfg: FetchConfig, *, client: httpx.Client,
 
     Redirects are followed here rather than by httpx, because httpx would follow them
     without consulting egress policy -- a public URL could then 302 straight into the
-    internal network. ``client`` must be configured with ``follow_redirects=False``;
-    the caller owns its lifecycle.
+    internal network. We force ``follow_redirects=False`` per request to ensure this
+    safety property holds regardless of how the caller configured their client. The
+    caller owns the client's lifecycle.
     """
     current = url
     for _ in range(cfg.max_redirects + 1):
         validate_url(current, cfg, resolve=resolve)
-        resp = client.get(current)
+        resp = client.get(current, follow_redirects=False)
         if resp.status_code not in _REDIRECT_CODES:
             return resp
         location = resp.headers.get("location")

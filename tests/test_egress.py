@@ -261,3 +261,60 @@ def test_guarded_get_blocks_the_initial_url_before_any_request():
         with pytest.raises(BlockedAddressError):
             guarded_get("http://10.0.0.1/x", FetchConfig(), client=c, resolve=_public())
     assert called == []          # never left the process
+
+
+def test_guarded_get_validates_hops_even_if_client_follows_redirects():
+    """The guarantee must not depend on how the caller built their client.
+
+    A client with follow_redirects=True would otherwise let httpx walk the chain
+    internally, bypassing per-hop validation entirely while still appearing to work.
+    """
+    def handler(request):
+        if "127.0.0.1" in str(request.url):
+            return httpx.Response(200, text="internal data")
+        return httpx.Response(302, headers={"Location": "http://127.0.0.1:8080/admin"})
+
+    with httpx.Client(transport=httpx.MockTransport(handler), follow_redirects=True) as c:
+        with pytest.raises(BlockedAddressError, match="127.0.0.1"):
+            guarded_get("https://example.com/start", FetchConfig(), client=c,
+                        resolve=_public("example.com"))
+
+
+def test_guarded_get_enforces_max_redirects_with_exact_count():
+    """Verify the redirect budget is exactly max_redirects (initial + redirects, not off-by-one)."""
+    requests_made = []
+
+    def handler(request):
+        requests_made.append(str(request.url))
+        return httpx.Response(302, headers={"Location": "https://example.com/loop"})
+
+    with _client(handler) as c:
+        with pytest.raises(httpx.HTTPError, match="too many redirects"):
+            guarded_get("https://example.com/loop", FetchConfig(max_redirects=3), client=c,
+                        resolve=_public("example.com"))
+    # Expect exactly 4 requests: initial + 3 allowed redirects
+    assert len(requests_made) == 4
+
+
+@pytest.mark.parametrize("status_code", [303, 307, 308])
+def test_guarded_get_blocks_non_302_redirect_into_loopback(status_code):
+    """Verify all redirect codes (not just 302) trigger hop validation."""
+    def handler(request):
+        return httpx.Response(status_code, headers={"Location": "http://127.0.0.1:8080/admin"})
+
+    with _client(handler) as c:
+        with pytest.raises(BlockedAddressError, match="127.0.0.1"):
+            guarded_get("https://example.com/start", FetchConfig(), client=c,
+                        resolve=_public("example.com"))
+
+
+def test_guarded_get_blocks_redirect_to_public_metadata_address():
+    """Test that 302 to a public metadata address (Azure wireserver) is blocked."""
+    def handler(request):
+        return httpx.Response(302,
+                              headers={"Location": "http://168.63.129.16/metadata"})
+
+    with _client(handler) as c:
+        with pytest.raises(BlockedAddressError, match="blocked cloud metadata endpoint"):
+            guarded_get("https://example.com/start", FetchConfig(), client=c,
+                        resolve=_public("example.com"))
