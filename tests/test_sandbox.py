@@ -404,3 +404,28 @@ def test_id_reuse_rejection_is_reported_not_silent(tmp_path):
     assert res.new_handles == []
     assert "already exists" in (res.error or "")
     assert store.summary(original.id) == original.summary()
+
+
+def test_resaving_an_id_within_one_run_also_raises(tmp_path):
+    # The registry is an import-time snapshot, so the child must also track what
+    # this run has already written.
+    sb, store = _sandbox(tmp_path)
+    res = sb.run_code(
+        "from tether_sandbox import save\n"
+        "save('h1', {'v': 1})\n"
+        "save('h1', {'v': 2})\n"
+    )
+    assert res.exit_code != 0
+    assert "already exists" in (res.error or "")
+
+
+def test_adopt_raises_a_typed_error_on_id_reuse(tmp_path):
+    # Ingestion dispatches on this type, not on message text.
+    from tether.handles import HandleIdReuseError
+
+    store = HandleStore(tmp_path)
+    h = store.put({"a": 1}, source="parent")
+    (tmp_path / "handles" / "x.txt").write_text("x")
+    with pytest.raises(HandleIdReuseError):
+        store.adopt(id=h.id, kind="text", path="handles/x.txt", source="s")
+    assert issubclass(HandleIdReuseError, ValueError)

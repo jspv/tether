@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from .config import SandboxConfig
-from .handles import HandleStore
+from .handles import HandleIdReuseError, HandleStore
 from .paths import safe_path
 
 _RUNTIME_DIR = Path(__file__).resolve().parent / "runtime"
@@ -188,10 +188,9 @@ class _OrchestratedSandbox:
                 handle = self.store.adopt(id=rec["id"], kind=rec["kind"],
                                           path=rec["path"], source=rec.get("source", "run_python"))
                 ids.append(handle.id)
-            except ValueError as e:
-                if "already exists" in str(e):
-                    reused.append(str(e))
-            except (KeyError, TypeError):
+            except HandleIdReuseError as e:
+                reused.append(str(e))
+            except (json.JSONDecodeError, ValueError, KeyError, TypeError):
                 continue
         parts = []
         if reused:

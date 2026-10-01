@@ -13,6 +13,14 @@ _PREVIEW_CHARS = 800
 _PREVIEW_ROWS = 5
 
 
+class HandleIdReuseError(ValueError):
+    """Raised when adopting an id that already exists. Handles are immutable.
+
+    Subclasses ValueError so every existing `except ValueError` caller keeps working;
+    ingestion catches it by type to report it rather than silently skipping.
+    """
+
+
 @dataclass
 class Handle:
     id: str
@@ -202,7 +210,7 @@ class HandleStore:
         the record for a handle the child did not create cannot be repointed.
         """
         if id in self._handles:
-            raise ValueError(f"handle id {id!r} already exists; handles are immutable")
+            raise HandleIdReuseError(f"handle id {id!r} already exists; handles are immutable")
         describer = self._DESCRIBERS.get(kind)
         if describer is None:
             raise ValueError(f"unknown handle kind: {kind!r}")

@@ -17,6 +17,7 @@ from typing import Any
 _ROOT = Path(os.environ["TETHER_ROOT"])
 _REGISTRY = json.loads(Path(os.environ["TETHER_REGISTRY"]).read_text(encoding="utf-8"))
 _NEW = Path(os.environ["TETHER_NEW_HANDLES"])
+_SAVED_THIS_RUN: set[str] = set()  # ids written by save() in this process
 _EMIT = Path(os.environ["TETHER_EMIT"])
 
 def load(handle_id: str) -> Any:
@@ -42,7 +43,10 @@ def save(handle_id: str, obj: Any, source: str = "run_python") -> str:
     """
     import pandas as pd
 
-    if handle_id in _REGISTRY:
+    # Ergonomics for honest code only, NOT a security control: a hostile child can skip
+    # save() and write the control file directly. The parent's refusal in adopt() is the
+    # real boundary.
+    if handle_id in _REGISTRY or handle_id in _SAVED_THIS_RUN:
         raise ValueError(
             f"handle id {handle_id!r} already exists and handles are immutable; "
             f"save under a new id"
@@ -61,6 +65,7 @@ def save(handle_id: str, obj: Any, source: str = "run_python") -> str:
     with _NEW.open("a") as f:
         f.write(json.dumps({"id": handle_id, "kind": kind, "path": rel,
                             "source": source}) + "\n")
+    _SAVED_THIS_RUN.add(handle_id)
     return handle_id
 
 
