@@ -77,7 +77,11 @@ def fetch_url(session: Session, url: str, max_bytes: int | None = None,
 
     scheme = urlparse(url).scheme
     if scheme not in cfg.allowed_schemes:
-        raise ValueError(f"scheme {scheme!r} not allowed (allowed: {cfg.allowed_schemes})")
+        # Structured, like every other failure here and like read_document's handling of
+        # exactly this case. Raising made one of this tool's failure modes arrive as a
+        # "function failed" the model could not read or adapt to.
+        return {"error": f"scheme {scheme!r} not allowed (allowed: {cfg.allowed_schemes})",
+                "status": None, "url": url}
 
     report_progress(f"fetching {url}", tool="fetch_url")
 

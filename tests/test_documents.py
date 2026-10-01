@@ -139,11 +139,20 @@ def _stub_get(monkeypatch, content=b"%PDF-1.4 fake"):
 def test_downloaded_documents_are_not_listed_as_artifacts(tmp_path, monkeypatch):
     session = _session(tmp_path)
     (session.root / "report.txt").write_text("mine", encoding="utf-8")
+    from pathlib import Path
+
     _stub_get(monkeypatch)
-    out = read_document(session, "https://example.com/a.pdf", convert=lambda s: "# md")
+    seen = []
+
+    def convert(src):
+        seen.append(src)
+        assert Path(src).exists()       # the download really happened, as a local file
+        return "# md"
+
+    out = read_document(session, "https://example.com/a.pdf", convert=convert)
     assert out["kind"] == "text"
     assert session.artifacts == ["report.txt"]
-    assert list(session.root.glob("_documents/doc_*.pdf"))   # it really was downloaded
+    assert seen and seen[0].startswith(str(session.root / "_documents"))
 
 
 def test_overlong_url_suffix_does_not_crash_and_lands_as_bin(tmp_path, monkeypatch):
@@ -251,3 +260,48 @@ def test_prefetch_models_includes_ocr_models_when_requested():
     calls = {}
     prefetch_models(downloader=lambda **kw: calls.update(kw), ocr=True)
     assert calls["with_rapidocr"] is True
+
+
+def test_downloaded_temp_file_is_removed_after_a_successful_conversion(tmp_path, monkeypatch):
+    """Every read_document(url) wrote up to max_bytes into the session root and left it
+    there: a model looping on read_document had an unbounded disk-growth primitive."""
+    session = _session(tmp_path)
+    _stub_get(monkeypatch)
+    for _ in range(3):
+        out = read_document(session, "https://example.com/a.pdf", convert=lambda s: "# md")
+        assert out["kind"] == "text"
+    assert list((session.root / "_documents").iterdir()) == []
+
+
+def test_downloaded_temp_file_is_removed_after_a_failed_conversion(tmp_path, monkeypatch):
+    session = _session(tmp_path)
+    _stub_get(monkeypatch)
+
+    def boom(src):
+        raise ValueError("corrupt pdf")
+
+    out = read_document(session, "https://example.com/a.pdf", convert=boom)
+    assert "could not read document" in out["error"]
+    assert list((session.root / "_documents").iterdir()) == []
+
+
+def test_a_workspace_file_is_never_deleted_by_the_cleanup(tmp_path):
+    """Only the scratch download is reaped -- a user's own file is converted in place."""
+    session = _session(tmp_path)
+    (session.root / "report.pdf").write_bytes(b"%PDF-1.4 fake")
+    read_document(session, "report.pdf", convert=lambda s: "# md")
+    assert (session.root / "report.pdf").exists()
+
+
+def test_narrowing_allowed_schemes_is_honored_by_read_document(tmp_path, monkeypatch):
+    """allowed_schemes was hard-coded here, so tightening it bound fetch_url and not this."""
+    session = _session(tmp_path, allowed_schemes=("https",))
+
+    def must_not_fetch(*a, **kw):
+        raise AssertionError("read_document fetched over a scheme the config disallows")
+
+    monkeypatch.setattr("tether.tools.documents.guarded_get", must_not_fetch)
+
+    out = read_document(session, "http://example.com/a.pdf", convert=lambda s: "# md")
+    assert "unsupported source scheme" in out["error"]
+    assert "https" in out["error"]                        # says what is allowed

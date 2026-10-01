@@ -101,8 +101,13 @@ def read_document(session: Session, source: str,
     ``convert`` is an injectable converter (defaults to Docling, honoring
     ``config.documents.ocr``) for testing.
     """
+    cfg = session.config.fetch
+    downloaded: Path | None = None
     scheme = urlparse(source).scheme
-    if scheme in ("http", "https"):
+    # The session's allowed schemes, not a hard-coded pair: narrowing
+    # FetchConfig.allowed_schemes to ("https",) was honored by fetch_url and silently
+    # ignored here, so the one lever that tightens egress worked on one of its two tools.
+    if scheme in cfg.allowed_schemes:
         # Docling fetches URLs itself and follows its own redirects, which egress policy
         # cannot see. Download through the guard instead and convert the local file, so
         # every hop is validated and Docling has exactly one input shape: a local path.
@@ -121,8 +126,8 @@ def read_document(session: Session, source: str,
         except PathEscapesRootError:
             return {"error": f"path escapes the workspace root: {source!r}", "source": source}
     else:
-        return {"error": f"unsupported source scheme {scheme!r}; pass a workspace path or an "
-                         "http(s) URL", "source": source}
+        return {"error": f"unsupported source scheme {scheme!r}; pass a workspace path or a "
+                         f"URL with one of {cfg.allowed_schemes}", "source": source}
 
     if convert is None:
         ocr = session.config.documents.ocr
@@ -137,6 +142,13 @@ def read_document(session: Session, source: str,
                          "(e.g. `uv sync --extra docling`) to enable Docling", "source": source}
     except Exception as e:  # noqa: BLE001 - unsupported/corrupt file etc. -> structured error
         return {"error": f"could not read document: {e}", "source": source}
+    finally:
+        if downloaded is not None:
+            # The download is scratch: once converted (or once conversion has failed) it has
+            # no further use, and the markdown lives in a handle. Leaving it behind gave a
+            # model looping on read_document an unbounded disk-growth primitive -- up to
+            # max_bytes (10 MB by default) per call, forever, in a long-lived conversation.
+            downloaded.unlink(missing_ok=True)
 
     handle = session.store.put(markdown, source=f"read_document({source})", kind="text")
     return handle.summary()

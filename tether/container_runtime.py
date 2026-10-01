@@ -34,13 +34,25 @@ def detect_runtime(override: str | None, which: Callable[[str], str | None] = sh
     raise RuntimeError("no container runtime found: neither podman nor docker is on PATH")
 
 
+_usable_runtime_cache: dict[str | None, str] = {}
+
+
 def require_usable_runtime(override: str | None, run: Callable = subprocess.run) -> str:
     """Return a runtime that is actually usable, else raise RuntimeError.
 
     ``detect_runtime`` only checks PATH. A machine with podman installed but its VM not
     started passes that check and then fails at first use with an opaque image-build error.
-    Probing once per session is cheap next to building or running a container.
+
+    **Successes are cached per process, keyed on the override; failures never are.** The
+    probe shells out to ``<runtime> info`` with a 30 s timeout, and since the container
+    backend became the default this runs on the event loop once per ``Session.create`` --
+    that is once per *conversation* on a multi-conversation host, which would pay for the
+    same answer over and over. A runtime that answered once is not going to stop being
+    installed. The reverse is not true: a user who starts their VM after a failure must get
+    a working harness on the next try, not be told to restart the process.
     """
+    if override in _usable_runtime_cache:
+        return _usable_runtime_cache[override]
     runtime = detect_runtime(override)
     try:
         proc = run([runtime, "info"], capture_output=True, timeout=30)
@@ -53,6 +65,7 @@ def require_usable_runtime(override: str | None, run: Callable = subprocess.run)
             f"container runtime {runtime!r} is installed but not responding ({hint}). "
             f"On macOS this usually means the VM is not started -- try `{runtime} machine start`."
         )
+    _usable_runtime_cache[override] = runtime
     return runtime
 
 

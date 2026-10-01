@@ -254,3 +254,47 @@ def test_constructor_runtimeerror_is_not_relabelled_as_a_missing_runtime(tmp_pat
         _build_sandbox(tmp_path / "r", store, SandboxConfig(backend="container"))
     assert not isinstance(excinfo.value, SandboxRuntimeUnavailable)
     assert "bind mount setup failed" in str(excinfo.value)
+
+
+def test_a_successful_probe_is_cached_per_process(monkeypatch):
+    """`<runtime> info` is a subprocess with a 30s timeout, run on the event loop once per
+    Session.create -- i.e. once per conversation. A multi-conversation host pays it once."""
+    _present(monkeypatch)
+    calls = []
+
+    def run(cmd, **kw):
+        calls.append(cmd)
+        return SimpleNamespace(returncode=0, stderr=b"")
+
+    assert require_usable_runtime(None, run=run) == "podman"
+    assert require_usable_runtime(None, run=run) == "podman"
+    assert len(calls) == 1
+
+
+def test_the_cache_is_keyed_on_the_override(monkeypatch):
+    monkeypatch.setattr("tether.container_runtime.detect_runtime",
+                        lambda override, which=None: override or "podman")
+    calls = []
+
+    def run(cmd, **kw):
+        calls.append(cmd[0])
+        return SimpleNamespace(returncode=0, stderr=b"")
+
+    require_usable_runtime(None, run=run)
+    require_usable_runtime("docker", run=run)
+    require_usable_runtime("docker", run=run)
+    assert calls == ["podman", "docker"]
+
+
+def test_a_failed_probe_is_not_cached(monkeypatch):
+    """Starting the VM must be enough; the user should not have to restart the process."""
+    _present(monkeypatch)
+    state = {"up": False}
+
+    def run(cmd, **kw):
+        return SimpleNamespace(returncode=0 if state["up"] else 125, stderr=b"not running")
+
+    with pytest.raises(RuntimeError):
+        require_usable_runtime(None, run=run)
+    state["up"] = True                                  # the user starts their VM
+    assert require_usable_runtime(None, run=run) == "podman"

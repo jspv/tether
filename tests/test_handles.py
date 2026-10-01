@@ -164,6 +164,11 @@ def test_describe_dataframe_pins_pandas_dtype_vocabulary(tmp_path):
     calling _describe_dataframe, so both sides of that equality are the same code.
     These values are pandas' own dtype reprs -- arrow would render them "int64"/"double"/
     "string"/"bool"/"timestamp[us]".
+
+    NOTE: ``"s": "str"`` is **pandas 3.x**'s repr for a string column. On pandas 2.x the
+    same column reports ``"object"``, so a downgrade fails this assertion. That is a
+    dependency change, not a regression in ``_describe_dataframe``; update the expected
+    vocabulary rather than the describer.
     """
     store = HandleStore(tmp_path / "r")
     df = pd.DataFrame({"i": range(3), "f": [1.5] * 3, "s": ["a"] * 3, "b": [True] * 3})

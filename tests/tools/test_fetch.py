@@ -1,5 +1,4 @@
 import httpx
-import pytest
 
 from tether import TetherConfig, Session
 from tether.config import FetchConfig
@@ -38,9 +37,13 @@ def test_fetch_text_returns_text_handle(tmp_path):
 
 
 def test_fetch_rejects_disallowed_scheme(tmp_path):
+    """Structured, not raised: every other failure in this tool returns a dict the model
+    can read and adapt to, and sibling read_document returns one for exactly this case."""
     sess = _session(tmp_path)
-    with pytest.raises(ValueError, match="scheme"):
-        fetch_url(sess, "file:///etc/passwd")
+    out = fetch_url(sess, "file:///etc/passwd")
+    assert "scheme" in out["error"] and "not allowed" in out["error"]
+    assert out["url"] == "file:///etc/passwd"
+    assert out["status"] is None
 
 
 def test_fetch_truncates_body_over_max_bytes(tmp_path):

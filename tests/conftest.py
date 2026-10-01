@@ -14,6 +14,15 @@ import pytest
 
 @pytest.fixture(autouse=True)
 def _no_real_dns(monkeypatch):
+    """WARNING: this makes **every** hostname resolve, to one public address.
+
+    It is a blanket allow, not a neutral stub. Under it ``http://anything.internal/`` and
+    ``http://localhost.evil.test/`` both resolve to 93.184.216.34 and sail through the
+    egress guard. A test asserting that something is **denied** must therefore not rely on
+    a hostname: use a literal IP (which skips resolution entirely) or inject its own
+    ``resolve=``. Writing a denial test against a hostname here produces a test that passes
+    for the wrong reason and would keep passing with the guard removed.
+    """
     def _stub(host: str) -> list[str]:
         return ["93.184.216.34"]
 
@@ -52,3 +61,17 @@ def _quiet_no_isolation_warning():
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", NoSandboxIsolationWarning)
         yield
+
+
+@pytest.fixture(autouse=True)
+def _clear_runtime_probe_cache():
+    """``require_usable_runtime`` caches a successful probe for the life of the process.
+
+    Tests stub the probe with different runners, so a cached answer from one would be
+    served to the next -- and with random test ordering that is a flake, not a failure.
+    """
+    from tether import container_runtime
+
+    container_runtime._usable_runtime_cache.clear()
+    yield
+    container_runtime._usable_runtime_cache.clear()
