@@ -405,3 +405,15 @@ Workstreams are independent and land in this order, each its own reviewable unit
   calls; the harness cannot filter them. This is a documented property of trusting a server
   you install, not a gap this phase can close.
 - **Rate limiting or quota on egress.** A separate concern from address filtering.
+
+## Amended during implementation
+
+The egress section above describes the original design. As shipped, the cloud-metadata check
+differs in two ways:
+
+- **Six endpoints are covered, not one:** `169.254.169.254`, `169.254.170.2` (AWS ECS),
+  `168.63.129.16` (Azure wireserver, a *public* address that no range check would catch),
+  `100.100.100.200` (Alibaba), `192.0.0.192` (Oracle), and `fd00:ec2::254` (AWS IMDS over IPv6).
+- **They are non-allowlistable.** The check runs ahead of `allow_private_hosts` and nothing in
+  `FetchConfig` can open them. Allowlisting a hostname vouches for the name, not for whatever
+  it resolves to later.

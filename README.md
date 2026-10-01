@@ -18,7 +18,7 @@ This is **v1: the general substrate**. Specific problems plug in later as user-s
 - **Tools and MCP, auto-handled.** Plain Python callables and MCP servers (stdio / HTTP / WebSocket) drop into one `tools=[…]` list; spill handling and server lifecycle are managed for you.
 - **Live status.** Built-in, developer (`report_progress`), and MCP-server progress all stream through one `on_status` feed, `--verbose`, or AG-UI events.
 - **AG-UI / CopilotKit.** Stream answer text, tool-call visibility, and status as AG-UI events; frontend tools, shared state, human-in-the-loop, and multi-turn history all work.
-- **Confined by construction.** One session root holds everything; every model-supplied path passes through a single `safe_path` chokepoint, and a hardened container sandbox tier is available for real isolation.
+- **Confined by construction.** One session root holds everything; every model-supplied path passes through a single `safe_path` chokepoint, and the container sandbox tier (real isolation) is the default, and parent-side fetches are filtered against internal address space.
 
 ## Table of contents
 
@@ -283,6 +283,18 @@ result = h.solve("…", tools=[mcp])
 
 MCP support needs the `mcp` SDK, which is a declared dependency, so `uv sync` already installs it.
 
+**Serving many conversations: `tool_factory`.** A single live `MCPTool` is fine for one run, but it is owned and closed by whichever session finishes first, and every conversation would share its connection. For a host serving many conversations (AG-UI, CopilotKit), wrap the construction so each conversation builds and connects its own server:
+
+```python
+from tether import Tether, tool_factory
+from agent_framework import MCPStdioTool
+
+h = Tether(tools=[tool_factory(lambda: MCPStdioTool(name="msgraph", command="uv",
+                                                    args=["run", "msgraph-mcp"]))])
+```
+
+`tool_factory` takes a zero-argument callable; it is called once per conversation. Only MCP-shaped objects are cleaned up on teardown: a session recognizes them by duck-typing on `connect`, `close`, and `.functions`, and closes the ones it connected. If your factory returns some other stateful object (a database client, say), the tether will not close it — manage its lifecycle yourself.
+
 **On result size.** Spilling is lossless — a large page is preserved whole as a handle, so an MCP server's pagination cursor survives and the agent can fetch the next page. The two ends of the spill-over zone are configurable (`spill_threshold_bytes` … `max_spill_bytes`): a well-behaved server that paginates returns bounded pages that flow through cleanly, while an unbounded dump past `max_spill_bytes` raises `SpillLimitExceeded` rather than silently filling disk — nudging the source toward server-side pagination/filtering.
 
 ### Live status updates
@@ -361,30 +373,35 @@ The agent gets a small, fixed set of root-confined tools (listed below; the web 
 Every session has one **root directory**; everything — handles, agent-written scripts, reads/writes, the sandbox `cwd` — lives under it.
 
 - **Layer 1 — Tool path-jail (guaranteed).** All model-supplied paths route through one chokepoint, `safe_path(root, p)`, which resolves symlinks *before* checking and rejects any path outside the root (blocks `..`, absolute paths, symlink escapes). It's the most heavily tested code in the project.
-- **Layer 2 — Executed code.** On the default `local` tier, `run_python` runs in a subprocess with `cwd=root`, a scrubbed environment, `resource` rlimits (CPU, memory, file size) and a wall-clock timeout (best-effort isolation). For real isolation, switch to the `container` tier — see [Sandbox tiers](#sandbox-tiers).
+- **Layer 2 — Executed code.** `run_python` runs in the **container** tier by default: a hardened Podman/Docker container (network off, read-only root filesystem, dropped capabilities, non-root, memory/cpu/pid limits) — see [Sandbox tiers](#sandbox-tiers). If no usable container runtime is present, building the sandbox is a hard error (`SandboxRuntimeUnavailable`) that names the `local` opt-out; it never falls back silently. The `local` tier provides **no isolation**: the code runs as the host user. Use it only when you have chosen that deliberately.
+- **Layer 3 — Egress.** The model chooses the URLs the harness fetches, so egress is filtered. `fetch_url` and `read_document(url)` deny loopback, private, link-local, reserved, multicast and unspecified addresses by default, plus `100.64.0.0/10` (RFC 6598 carrier-grade NAT), which no standard `ipaddress` flag reports as private and so is denied explicitly. The harness follows redirects itself (`follow_redirects=False` is forced on every request), so **every hop is re-validated**. `read_document` downloads through the same guard and hands Docling a local path, never a URL, so Docling cannot follow its own redirects outside policy. To reach an internal data source, name it in `FetchConfig.allow_private_hosts` (hostnames or CIDRs).
+  - **Cloud metadata endpoints are denied unconditionally and cannot be allowlisted.** `allow_private_hosts` cannot open them, by design: `169.254.169.254`, `169.254.170.2`, `168.63.129.16`, `100.100.100.200`, `192.0.0.192` and `fd00:ec2::254`. Note `168.63.129.16` (Azure's wireserver) is a *public* address that nothing else would block; Azure users should expect it to be refused.
+  - Known residual: the host is resolved for validation and then resolved again by the HTTP client, so a DNS-rebinding race is not closed (IP pinning is on the [roadmap](docs/ROADMAP.md)). `web_search` / `web_extract` call a fixed Tavily endpoint and are not filtered; an MCP server you install makes its own network calls, which the harness cannot filter.
+- **Handle integrity.** Metadata the model sees for a handle (schema, row count, preview) is always derived by the harness from the bytes on disk, never reported by the sandboxed code that wrote them, and handles are immutable once created: adopting an existing id is refused and reported. A script cannot describe its output falsely or repoint an existing handle. The parent↔sandbox control channel is bounded (1 MiB emit payload, 8 MiB control file, 256 new handles per run; see the configuration table).
+- **Tool isolation.** Wrap stateful tools such as MCP servers in `tool_factory` so each conversation gets its own instance (see [MCP servers](#mcp-servers)).
 
-> The **container tier** provides real isolation: set `TetherConfig.sandbox.backend = "container"` to run `run_python` in a hardened Podman/Docker container — network off by default, read-only root filesystem, dropped capabilities, non-root, and memory/cpu/pid limits — behind the same `SandboxExecutor` interface (no other tether code changes).
+> The **container tier** is the default and provides real isolation. Select `local` explicitly with `TetherConfig.sandbox.backend = "local"` (or `TETHER_SANDBOX_BACKEND=local`) to opt out; both sit behind the same `SandboxExecutor` interface.
 
 ### Sandbox tiers
 
-`run_python` executes model-authored code; two backends are chosen by `TetherConfig.sandbox.backend`.
+`run_python` executes model-authored code; two backends are chosen by `TetherConfig.sandbox.backend`. **`container` is the default**; `local` is an explicit opt-out.
 
-- **`local`** (default) — a scrubbed-env subprocess with `resource` rlimits, a wall-clock timeout, and the path-jail. Fast, no dependencies; best-effort isolation.
-- **`container`** — runs the code in a hardened OCI container (Podman preferred, Docker supported; auto-detected). Network **off by default**, read-only root filesystem, `--cap-drop ALL`, non-root, and memory/cpu/pid limits. The session root is bind-mounted to `/workspace`, so handles round-trip exactly as in the local tier.
+- **`container`** (default) — runs the code in a hardened OCI container (Podman preferred, Docker supported; auto-detected). Network **off by default**, read-only root filesystem, `--cap-drop ALL`, non-root, and memory/cpu/pid limits. The session root is bind-mounted to `/workspace`, so handles round-trip exactly as in the local tier. If no usable runtime is found (a binary on `PATH` is not enough — the check probes liveness with `<runtime> info`), building the sandbox raises `SandboxRuntimeUnavailable`, with a message naming the `local` opt-out.
+- **`local`** (explicit opt-out) — a scrubbed-env subprocess with `resource` rlimits, a wall-clock timeout, and the path-jail. Fast, no dependencies, but **no isolation**: the code runs as the host user and can read or write anything that user can, and use the network. Selecting it emits `NoSandboxIsolationWarning`; filter it with `warnings.filterwarnings("ignore", category=tether.NoSandboxIsolationWarning)` once you have decided deliberately (CI, tests).
 
 ```python
 from tether import Tether, TetherConfig
 from tether.config import SandboxConfig
 
 cfg = TetherConfig(sandbox=SandboxConfig(
-    backend="container",
+    backend="container",           # the default; "local" opts out of isolation
     network=False,                 # opt-in with True if sandbox code must reach the network
     pip_packages=("rich",),        # provisioned into a mounted layer (network only during provisioning)
 ))
 Tether(cfg).solve("…")
 ```
 
-The image (Python + `preinstalled` libraries) is **built automatically on first use** and cached; run `tether-build-sandbox` to pre-build it in CI/deploy. Notes: on macOS the runtime runs in a Linux VM, so the session root must sit under a VM-shared path (the default `~/.tether/...` is); the container tier does not enforce `max_file_size_mb` (memory/pid/cpu/network are enforced instead).
+The image (Python + `preinstalled` libraries) is **built automatically on first use** and cached; run `tether-build-sandbox` to pre-build it in CI/deploy. Notes: on macOS the runtime runs in a Linux VM, so the session root must sit under a VM-shared path (the default `~/.tether/...` is); the container tier does not enforce `max_file_size_mb` (memory/pid/cpu/network are enforced instead). The explicit `network=True` option exposes the container to the network; the egress guard applies to the harness's own fetches, not to code running in the sandbox.
 
 ### Configuration
 
@@ -399,10 +416,17 @@ The image (Python + `preinstalled` libraries) is **built automatically on first 
 | `max_output_tokens` | `4096` | |
 | `root_dir` | `None` | `None` → a session dir under `./.tether/sessions/` |
 | `idle_ttl_s` | `None` | Continuous-session idle TTL; `None` → never expire |
-| `sandbox` | `SandboxConfig()` | `backend` (local/container), timeout, limits, network, `pip_packages`, preinstalled libs |
+| `sandbox` | `SandboxConfig()` | `backend` (`container` by default; `local` = no isolation), `container_runtime`, timeout, limits, network, `pip_packages`, preinstalled libs. **`max_file_size_mb` is enforced by the `local` tier only** — under the default `container` backend it has no effect (memory/cpu/pid limits and the network setting apply instead) |
 | `fetch` | `FetchConfig()` | `max_bytes`, timeout, allowed URL schemes |
+| `fetch.allow_private_hosts` | `()` | Hostnames or CIDRs exempted from the internal-address denylist, for internal data sources. Cloud metadata endpoints cannot be allowlisted |
+| `fetch.max_redirects` | `5` | Redirect hops followed (each re-validated); more raises an error |
+| `max_emit_bytes` | `1 MiB` | Cap on a sandbox emit payload, checked before parsing |
+| `max_control_bytes` | `8 MiB` | Read cap on the sandbox's new-handles control file |
+| `max_new_handles` | `256` | Handle records adopted per `run_python` call |
 | `search` | `SearchConfig()` | Tavily provider, key, `max_results` |
 | `documents` | `DocumentConfig()` | Docling ingestion: `ocr` (off by default) |
+
+**`TETHER_SANDBOX_BACKEND`.** An environment variable that overrides the default of `SandboxConfig.backend`. It selects the **tier** (`container` or `local`), *not* the container runtime — use `SandboxConfig.container_runtime` to choose podman or docker. Setting it to `local` opts out of isolation; that is intended for CI and test environments that have made the choice deliberately. An explicit `SandboxConfig(backend=...)` always wins over the variable. Any value other than exactly `local` or `container` is an error (`ValueError`), not a silent fallback.
 
 ## Development
 
@@ -431,6 +455,7 @@ tether/
   spill.py       large/structured tool & MCP returns → handles (MAF result_parser)
   agui.py        AG-UI event stream (status overlay over agent-framework-ag-ui)
   bundles.py     capability bundles (code / files / web) + their instructions
+  egress.py      egress policy: internal-address denylist + redirect re-validation
   tools/         the agent's tools (files, search, fetch, code, inspect, web)
   runtime/       in-sandbox helpers (load/save/emit)
   api.py         Tether / solve() / Result
@@ -444,6 +469,8 @@ tests/             mirror of the package (unit + integration + security tests)
 ## Roadmap
 
 **Implemented:** foundation (handles, sandbox, path-jail); the agent loop + tool surface; the `Tether`/`solve()` API + CLI; web research (Tavily search/extract, Markdown fetch); **document ingestion** (`read_document` via Docling — PDF/spreadsheet → Markdown with tables); **live status updates** (built-in, developer, and MCP tools → an `on_status` feed / `--verbose`); an **AG-UI / CopilotKit** integration (`Tether.agui_stream`); a **container sandbox tier** (hardened Podman/Docker isolation behind `SandboxExecutor`); and a **session lifecycle** model (ephemeral one-shot `solve`; persistent continuous `aopen`/`aask`/`aclose` with optional idle TTL).
+
+The **security-hardening phase** (zero-trust handle metadata, container-by-default, egress guard, per-conversation tools) is delivered; see [`docs/ROADMAP.md`](docs/ROADMAP.md) for residuals.
 
 **Planned** (documented under [`docs/superpowers/`](docs/superpowers/)):
 

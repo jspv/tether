@@ -4,36 +4,41 @@ Status of work beyond the shipped v0.1.1 surface. The README documents what exis
 this file tracks what doesn't yet. Per-item design specs and phased plans live in
 `docs/superpowers/specs/` and `docs/superpowers/plans/`.
 
-Last reviewed: 2026-09-17.
+Last reviewed: 2026-10-01.
 
 ## In progress
 
-### Security hardening — make the trust boundary real
-**Priority: next.** The threat model (below) says the model and everything it fetches are
-untrusted, but the code does not yet enforce that. Four workstreams:
+Nothing currently.
 
-1. **Untrusted sandbox control plane.** The parent trusts child-written handle metadata
-   (`preview`, `bytes`, `schema`, `n_rows`) verbatim and re-enters it into model context,
-   uncapped; `HandleStore.register` also lets a child overwrite the record of a handle id it
-   did not create. Paths are already validated through `safe_path`, so this is a metadata
-   integrity and context-flood problem, not a path-escape one.
-2. **Isolation off by default.** `SandboxConfig.backend` defaults to `"local"` — a scrubbed
-   subprocess running as the host user. The container tier exists and is hardened; it should
-   be the default, with `local` an explicit, loudly-named opt-out.
-3. **No SSRF filtering on egress.** `fetch_url` runs parent-side with no private/loopback/
-   link-local/metadata-IP blocking and no redirect re-validation. `web_extract` and
-   `read_document(url)` share the exposure and need the same guard.
-4. **Cross-conversation resource sharing.** `SessionManager.aopen` passes the same live
-   `_tether._tools` list (including connected MCP servers) to every conversation, making it a
-   cross-tenant leak vector rather than just a lifecycle wart.
+## Delivered
+
+### Security hardening — make the trust boundary real
+Delivered 2026-10-01; design in `docs/superpowers/specs/2026-09-17-security-hardening-design.md`.
+Zero-trust handle metadata (the parent derives every field from the bytes; handles are
+immutable; the control channel is bounded), container backend by default, an egress guard
+(`tether/egress.py`) covering `fetch_url` and `read_document`, and per-conversation tools via
+`tool_factory`. Residuals are listed under Planned and Smaller carry-overs.
 
 ## Planned
 
+### IP pinning (full DNS-rebinding closure)
+The egress guard resolves a host to validate it and the HTTP client resolves it again, so a
+DNS entry that changes in between is not caught. Closing it needs connect-to-validated-IP with
+a Host override (custom transport, with TLS SNI care). Out of scope for the hardening phase;
+the residual TOCTOU window is accepted.
+
+### Control-plane relocation
+Moving the sandbox control files out of the child-visible session root. Superseded for
+security purposes by parent-side re-derivation of handle metadata; optional defence in depth.
+
+### Streaming fetch bodies
+`fetch_url` and `read_document` hold the whole response body in memory; `max_bytes` caps what
+is *written*, not what is *held*. Fixing this needs a streaming `guarded_get` variant.
+
 ### Micro-VM sandbox tier
 gVisor / Firecracker behind the existing `SandboxExecutor` interface, as a third `backend`
-value alongside `local` and `container`. Deliberately sequenced after the hardening work:
-adding a stronger tier while the default tier provides no isolation would not move the
-weakest link.
+value alongside `local` and `container`. Sequenced after the hardening work, which has now made the
+container tier the default.
 
 ### MAF skills + memory providers (v1.1)
 Wire MAF's `Skill`/`SkillsProvider` and `MemoryStore`/`MemoryContextProvider` into the
@@ -53,14 +58,14 @@ Real but low-severity; each is a contained fix.
   replacement characters instead of returning a clear "this is binary, use a handle" signal.
 - **`inspect_handle` calls `describe()` unguarded** (`tools/inspect.py:18`) — the shape is
   wrong for non-numeric frames, and it materializes the whole object to do it.
-- **`max_file_size_mb` is silently ignored on the container tier** (documented in the README,
-  but a config field that does nothing on the default-to-be backend is a trap).
+- **`max_file_size_mb` is silently ignored on the container tier** — now the default backend,
+  so the config field does nothing by default. Documented as local-tier-only in the README;
+  a container-side equivalent (or a warning when it is set) is still open.
+- **Ruff scanned agent worktrees.** The tooling worktree directory is now excluded in
+  `pyproject.toml`, so `ruff check .` no longer reports copies of the code. The remaining
+  lint findings (unused imports, late imports in tests) are pre-existing and untouched.
 - **`_OrchestratedSandbox` is sequential and not re-entrant per root** — fine at current
   scale; revisit if concurrent runs per conversation are ever needed.
-- **Handle preview parity is hand-maintained.** `runtime/tether_sandbox.save` must mirror
-  `HandleStore._write_dataframe` exactly because the child cannot import the package. A
-  parity test guards it; re-deriving metadata parent-side (hardening item 1) would retire
-  the duplication.
 
 ## Explicitly out of scope
 
