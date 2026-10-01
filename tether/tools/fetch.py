@@ -15,6 +15,7 @@ from urllib.parse import urlparse
 import httpx
 
 from ..config import FetchConfig
+from ..egress import BlockedAddressError, guarded_get
 from ..session import Session
 from ..status import report_progress
 
@@ -26,9 +27,11 @@ _TEXTUAL = ("json", "xml", "html", "csv", "javascript")
 
 
 def _default_client(cfg: FetchConfig) -> httpx.Client:
+    # follow_redirects=False: guarded_get follows hops itself so each one is re-validated
+    # against egress policy. Letting httpx follow them would skip that check.
     return httpx.Client(
         timeout=cfg.timeout_s,
-        follow_redirects=True,
+        follow_redirects=False,
         headers={"User-Agent": _USER_AGENT},
     )
 
@@ -65,8 +68,9 @@ def fetch_url(session: Session, url: str, max_bytes: int | None = None,
     text is stored unchanged.
 
     Returns the handle summary on success, or ``{"error", "status", "url"}`` on an HTTP
-    error / network failure. Follows redirects and sends a browser User-Agent. Enforces
-    the session's allowed schemes and byte cap. ``client`` is injectable for testing.
+    error / network failure. Follows redirects, re-validating each hop against egress
+    policy, and sends a browser User-Agent. Enforces the session's allowed schemes and
+    byte cap. ``client`` is injectable for testing.
     """
     cfg = session.config.fetch
     limit = max_bytes if max_bytes is not None else cfg.max_bytes
@@ -81,7 +85,9 @@ def fetch_url(session: Session, url: str, max_bytes: int | None = None,
     client = client or _default_client(cfg)
     try:
         try:
-            resp = client.get(url)
+            resp = guarded_get(url, cfg, client=client)
+        except BlockedAddressError as e:
+            return {"error": f"blocked by egress policy: {e}", "status": None, "url": url}
         except httpx.HTTPError as e:
             return {"error": f"request failed: {e}", "status": None, "url": url}
 
