@@ -5,6 +5,10 @@ so egress is a model-controlled capability. This module denies the internal addr
 and cloud instance-metadata endpoints by default. Metadata endpoints are checked
 unconditionally and cannot be overridden by the allowlist.
 
+When following redirects, guarded_get re-validates each hop against egress policy, because
+httpx's redirect-following happens without consulting policy. Without this, a public URL
+could 302 straight into the internal network or metadata endpoints.
+
 Known residual risk: validation resolves the hostname and then hands the URL to httpx,
 which resolves it again -- a DNS entry that changes in between (rebinding) is not caught.
 Closing that needs connect-to-validated-IP with a Host override; see the spec's out-of-scope
@@ -16,7 +20,9 @@ from __future__ import annotations
 import ipaddress
 import socket
 from collections.abc import Callable
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
+
+import httpx
 
 from .config import FetchConfig
 
@@ -110,3 +116,28 @@ def validate_url(url: str, cfg: FetchConfig, *,
             raise BlockedAddressError(
                 f"blocked internal address {raw} for host {host!r}; add the host or its "
                 f"CIDR to FetchConfig.allow_private_hosts to permit it")
+
+
+_REDIRECT_CODES = frozenset({301, 302, 303, 307, 308})
+
+
+def guarded_get(url: str, cfg: FetchConfig, *, client: httpx.Client,
+                resolve: Callable[[str], list[str]] | None = None) -> httpx.Response:
+    """GET ``url``, validating the initial address and every redirect hop.
+
+    Redirects are followed here rather than by httpx, because httpx would follow them
+    without consulting egress policy -- a public URL could then 302 straight into the
+    internal network. ``client`` must be configured with ``follow_redirects=False``;
+    the caller owns its lifecycle.
+    """
+    current = url
+    for _ in range(cfg.max_redirects + 1):
+        validate_url(current, cfg, resolve=resolve)
+        resp = client.get(current)
+        if resp.status_code not in _REDIRECT_CODES:
+            return resp
+        location = resp.headers.get("location")
+        if not location:
+            return resp
+        current = urljoin(current, location)  # relative Location -> absolute, then re-validate
+    raise httpx.HTTPError(f"too many redirects (> {cfg.max_redirects}) starting at {url!r}")

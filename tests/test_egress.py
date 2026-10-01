@@ -1,7 +1,8 @@
+import httpx
 import pytest
 
 from tether.config import FetchConfig
-from tether.egress import BlockedAddressError, validate_url
+from tether.egress import BlockedAddressError, guarded_get, validate_url
 
 
 def _resolver(mapping):
@@ -164,3 +165,99 @@ def test_allowlisted_host_with_mixed_private_addresses():
     with pytest.raises(BlockedAddressError):
         validate_url("http://internal.corp/x", cfg,
                      resolve=_resolver({"internal.corp": ["10.1.2.3", "172.16.0.1"]}))
+
+
+# Tests for guarded_get
+
+def _client(handler):
+    return httpx.Client(transport=httpx.MockTransport(handler), follow_redirects=False)
+
+
+def _public(*hosts):
+    return lambda host: ["93.184.216.34"] if host in hosts else ["127.0.0.1"]
+
+
+def test_guarded_get_returns_a_direct_response():
+    def handler(request):
+        return httpx.Response(200, text="hello")
+
+    with _client(handler) as c:
+        resp = guarded_get("https://example.com/x", FetchConfig(), client=c,
+                           resolve=_public("example.com"))
+    assert resp.status_code == 200
+    assert resp.text == "hello"
+
+
+def test_guarded_get_follows_a_public_redirect():
+    def handler(request):
+        if request.url.path == "/start":
+            return httpx.Response(302, headers={"Location": "https://example.com/end"})
+        return httpx.Response(200, text="arrived")
+
+    with _client(handler) as c:
+        resp = guarded_get("https://example.com/start", FetchConfig(), client=c,
+                           resolve=_public("example.com"))
+    assert resp.text == "arrived"
+
+
+def test_guarded_get_blocks_a_redirect_into_loopback():
+    """The attack this exists to stop: a public URL 302-ing to an internal address."""
+    def handler(request):
+        return httpx.Response(302, headers={"Location": "http://127.0.0.1:8080/admin"})
+
+    with _client(handler) as c:
+        with pytest.raises(BlockedAddressError, match="127.0.0.1"):
+            guarded_get("https://example.com/start", FetchConfig(), client=c,
+                        resolve=_public("example.com"))
+
+
+def test_guarded_get_blocks_a_redirect_to_the_metadata_ip():
+    def handler(request):
+        return httpx.Response(302,
+                              headers={"Location": "http://169.254.169.254/latest/meta-data/"})
+
+    with _client(handler) as c:
+        with pytest.raises(BlockedAddressError):
+            guarded_get("https://example.com/start", FetchConfig(), client=c,
+                        resolve=_public("example.com"))
+
+
+def test_guarded_get_resolves_a_relative_redirect_before_validating():
+    """A relative Location must be joined against the current URL, or the host check
+    would run against an empty host and the hop would escape validation."""
+    seen = []
+
+    def handler(request):
+        seen.append(str(request.url))
+        if request.url.path == "/start":
+            return httpx.Response(302, headers={"Location": "/next"})
+        return httpx.Response(200, text="ok")
+
+    with _client(handler) as c:
+        resp = guarded_get("https://example.com/start", FetchConfig(), client=c,
+                           resolve=_public("example.com"))
+    assert resp.text == "ok"
+    assert seen == ["https://example.com/start", "https://example.com/next"]
+
+
+def test_guarded_get_enforces_max_redirects():
+    def handler(request):
+        return httpx.Response(302, headers={"Location": "https://example.com/loop"})
+
+    with _client(handler) as c:
+        with pytest.raises(httpx.HTTPError, match="too many redirects"):
+            guarded_get("https://example.com/loop", FetchConfig(max_redirects=3), client=c,
+                        resolve=_public("example.com"))
+
+
+def test_guarded_get_blocks_the_initial_url_before_any_request():
+    called = []
+
+    def handler(request):
+        called.append(str(request.url))
+        return httpx.Response(200)
+
+    with _client(handler) as c:
+        with pytest.raises(BlockedAddressError):
+            guarded_get("http://10.0.0.1/x", FetchConfig(), client=c, resolve=_public())
+    assert called == []          # never left the process
