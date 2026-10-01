@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
-from .paths import PathEscapesRootError, safe_filename, safe_path
+from .paths import safe_filename
 
 _INTERNAL_DIRS = ("handles", ".scripts")
 _CHUNK = 1024 * 1024
@@ -46,11 +46,13 @@ def validate_publication(root: Path | str, path: object, *, name: object, descri
                          snapshot_dir: Path | None = None) -> PublishedFile:
     """Validate a publication request and describe the file. Raises ``PublishError``.
 
-    Order matters: ``lstat`` on the *unresolved* path rejects a symlink before anything follows
-    it; ``safe_path`` then catches ``..``, absolute paths outside the root, and symlinked parent
-    directories that escape; internal trees and control files are refused; finally the file is
-    opened with ``O_NOFOLLOW`` and size + digest are taken from that descriptor, so they describe
-    the bytes that were actually checked.
+    No link is ever followed, so the answer never depends on the host filesystem (which would
+    let sandboxed code probe it): the path is normalized lexically and must stay inside the
+    root, then each component is ``lstat``-ed from the root down — every directory must be a
+    real directory and the last component a regular file, and a symlink anywhere is refused.
+    Internal trees and control files are refused; finally the file is opened with
+    ``O_NOFOLLOW`` and size + digest are taken from that descriptor, so they describe the bytes
+    that were actually checked.
 
     With ``snapshot_dir``, the checked bytes are also copied (from that same descriptor) into a
     file there, and ``PublishedFile.path`` points at the copy: the host then reads a private
@@ -61,22 +63,24 @@ def validate_publication(root: Path | str, path: object, *, name: object, descri
         raise PublishError(f"invalid publication path: {path!r}")
     root = Path(root).resolve()
     candidate = Path(path)
-    unresolved = candidate if candidate.is_absolute() else root / candidate
-    try:
-        st = os.lstat(unresolved)
-    except (OSError, ValueError) as e:
-        raise PublishError(f"no such file: {path!r}") from e
-    if stat.S_ISLNK(st.st_mode):
-        raise PublishError(f"refusing to publish a symlink: {path!r}")
-    if not stat.S_ISREG(st.st_mode):
-        raise PublishError(f"not a regular file: {path!r}")
-    try:
-        resolved = safe_path(root, path)
-    except PathEscapesRootError as e:
-        raise PublishError(f"path is outside the workspace: {path!r}") from e
-    except (OSError, ValueError) as e:
-        raise PublishError(f"invalid publication path: {path!r}") from e
+    resolved = Path(os.path.normpath(candidate if candidate.is_absolute() else root / candidate))
+    if resolved == root or root not in resolved.parents:
+        raise PublishError(f"path is outside the workspace: {path!r}")
     rel = resolved.relative_to(root)
+    current = root
+    for i, part in enumerate(rel.parts):
+        current = current / part
+        try:
+            st = os.lstat(current)
+        except (OSError, ValueError) as e:   # missing; NUL / unencodable characters
+            raise PublishError(f"no such file: {path!r}") from e
+        if stat.S_ISLNK(st.st_mode):
+            raise PublishError(f"refusing to publish through a symlink: {path!r}")
+        last = i == len(rel.parts) - 1
+        if not last and not stat.S_ISDIR(st.st_mode):
+            raise PublishError(f"no such file: {path!r}")
+        if last and not stat.S_ISREG(st.st_mode):
+            raise PublishError(f"not a regular file: {path!r}")
     if rel.parts[0] in _INTERNAL_DIRS or rel.parts[0].startswith("_"):
         raise PublishError(f"refusing to publish an internal tether file: {rel.as_posix()!r}")
 

@@ -156,20 +156,23 @@ class HandleStore:
         return handle
 
     def put_input(self, *, path: str, size: int, preview: str, source: str, input_id: str,
-                  content_type: str | None = None, description: str | None = None) -> Handle:
+                  content_type: str | None = None, description: str | None = None,
+                  replace: bool = False) -> Handle:
         """Register a host-ingested upload whose file already exists under ``inputs/``.
 
         Parent-authored (the host wrote the bytes), so it does not go through the sandbox
-        adoption path. Idempotent by ``input_id``: an existing input is returned unchanged.
+        adoption path. Idempotent by ``input_id``: an existing input is returned unchanged,
+        unless ``replace`` is set, which overwrites its record and keeps its handle id.
         """
         existing = self.inputs().get(input_id)
-        if existing is not None:
+        if existing is not None and not replace:
             return existing
         try:
             safe_path(self.root, path)
         except PathEscapesRootError as e:
             raise ValueError(f"input path escapes root: {path!r}") from e
-        handle = Handle(id=self._new_id(), kind="binary", path=path, source=source, bytes=size,
+        hid = existing.id if existing is not None else self._new_id()
+        handle = Handle(id=hid, kind="binary", path=path, source=source, bytes=size,
                         preview=preview, input_id=input_id, content_type=content_type,
                         description=description)
         self._handles[handle.id] = handle

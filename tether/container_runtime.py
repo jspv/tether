@@ -7,10 +7,12 @@ from __future__ import annotations
 import argparse
 import hashlib
 import os
+import secrets
 import shlex
 import shutil
 import subprocess
 import sys
+import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable
@@ -19,6 +21,7 @@ from .config import SandboxConfig, TetherConfig
 
 _RUNTIME_DIR = Path(__file__).resolve().parent / "runtime"
 _CONTAINERFILE = _RUNTIME_DIR / "Containerfile"
+_RM_TIMEOUT_S = 30.0
 _INSPECT_TIMEOUT_S = 10.0   # `image inspect` must never hang a check, even on a wedged daemon
 
 
@@ -79,8 +82,16 @@ def build_command_hint(config: SandboxConfig) -> str:
     return shlex.join(parts)
 
 
+def _remaining(deadline: float, what: str) -> float:
+    """Seconds left before ``deadline``; raises once the shared build budget is spent."""
+    left = deadline - time.monotonic()
+    if left <= 0:
+        raise SandboxImageError(f"{what} timed out (build_timeout_s exhausted)")
+    return left
+
+
 def ensure_image(runtime: str, tag: str, config: SandboxConfig,
-                 run: Callable = subprocess.run) -> None:
+                 run: Callable = subprocess.run, *, timeout_s: float | None = None) -> None:
     """Make sure the sandbox image exists.
 
     If it is missing and ``config.effective_build_on_demand`` is false, raise
@@ -96,11 +107,12 @@ def ensure_image(runtime: str, tag: str, config: SandboxConfig,
     build = [runtime, "build", "-t", tag,
              "--build-arg", f"PREINSTALLED={' '.join(config.preinstalled)}",
              "-f", str(_CONTAINERFILE), str(_RUNTIME_DIR)]
+    budget = config.build_timeout_s if timeout_s is None else timeout_s
     try:
-        proc = run(build, capture_output=True, text=True, timeout=config.build_timeout_s)
+        proc = run(build, capture_output=True, text=True, timeout=budget)
     except subprocess.TimeoutExpired as e:
         raise SandboxImageError(
-            f"building sandbox image {tag} timed out after {config.build_timeout_s:.0f}s "
+            f"building sandbox image {tag} timed out after {budget:.0f}s "
             f"(can the runtime reach the base-image registry?)") from e
     if proc.returncode != 0:
         raise SandboxImageError(f"failed to build sandbox image {tag}:\n{proc.stderr}")
@@ -132,9 +144,12 @@ def ensure_layer(runtime: str, config: SandboxConfig, base: Path | None = None,
             f"pip_packages layer {target} is not provisioned and build_on_demand is disabled. "
             f"Pre-build it with: {build_command_hint(config)}")
     target.mkdir(parents=True, exist_ok=True)
+    deadline = time.monotonic() + config.build_timeout_s   # one budget for build + install
     tag = image_tag(config.preinstalled)
-    ensure_image(runtime, tag, config, run)
-    cmd = [runtime, "run", "--rm"]
+    ensure_image(runtime, tag, config, run,
+                 timeout_s=_remaining(deadline, f"building sandbox image {tag}"))
+    name = f"tether-layer-{secrets.token_hex(8)}"
+    cmd = [runtime, "run", "--rm", "--name", name]
     # See ContainerSandbox._build_run_argv: rootless podman maps the host user to container-root,
     # so the host-owned /layer bind mount is unwritable to the hardening --user. keep-id maps the
     # host uid through so --user owns the mount. (podman-only; docker rootless rejects it.)
@@ -144,8 +159,13 @@ def ensure_layer(runtime: str, config: SandboxConfig, base: Path | None = None,
             "-v", f"{target}:/layer:rw", tag,
             "pip", "install", "--no-cache-dir", "--target", "/layer", *config.pip_packages]
     try:
-        proc = run(cmd, capture_output=True, text=True, timeout=config.build_timeout_s)
+        proc = run(cmd, capture_output=True, text=True,
+                   timeout=_remaining(deadline, f"provisioning pip_packages into {target}"))
     except subprocess.TimeoutExpired as e:
+        try:   # killing the CLI does not stop the container; remove it by name
+            run([runtime, "rm", "-f", name], capture_output=True, timeout=_RM_TIMEOUT_S)
+        except (subprocess.TimeoutExpired, OSError):
+            pass
         raise SandboxImageError(
             f"provisioning pip_packages into {target} timed out after "
             f"{config.build_timeout_s:.0f}s") from e

@@ -47,7 +47,8 @@ def build_tools(session: Session) -> list:
     def run_python(code: str | None = None, path: str | None = None,
                    args: list[str] | None = None) -> dict:
         """Run Python in the sandbox. Give `code` (inline) or `path` (a script file). Scripts
-        may use load(id)/save(id, obj)/emit(obj). Returns stdout/result/error/new_handles."""
+        may use load(id)/save(id, obj)/emit(obj), and publish(path) when file delivery is
+        enabled. Returns stdout/result/error/new_handles/published."""
         return _run_python(session, code, path, args)
 
     def inspect_handle(handle_id: str, rows: int = 20, stats: bool = False) -> dict:

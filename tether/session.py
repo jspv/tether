@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import mimetypes
 import os
 import shutil
@@ -9,13 +10,13 @@ import stat
 import tempfile
 import threading
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Callable
 
 from . import bundles as _bundles
 from .config import TetherConfig, SandboxConfig
 from .handles import _PREVIEW_CHARS, Handle, HandleStore
-from .paths import PathEscapesRootError, safe_filename, safe_path, validate_segment
+from .paths import safe_filename, validate_segment
 from .publish import OnPublish, PublishError, validate_publication
 from .sandbox import LocalSubprocessSandbox, SandboxExecutor, SandboxRuntimeUnavailable
 from .status import StatusBus, StatusEvent, bind_bus
@@ -25,6 +26,7 @@ _INPUTS = "inputs"
 _TEXT_PREVIEW_EXTS = {".csv", ".tsv", ".txt", ".json", ".md"}
 _PREVIEW_LINES = 5
 _PREVIEW_READ_BYTES = 4096
+_COPY_CHUNK = 1024 * 1024
 
 
 @dataclass
@@ -41,7 +43,10 @@ class Session:
     io_lock: Any = field(default_factory=threading.RLock, init=False, repr=False)
 
     @classmethod
-    def create(cls, config: TetherConfig, *, on_publish: OnPublish | None = None) -> "Session":
+    def create(cls, config: TetherConfig, *, on_publish: OnPublish | None = None,
+               bundles: tuple[str, ...] | None = None) -> "Session":
+        """Open the workspace. Sandbox ``publish()`` is enabled only when ``on_publish`` is set
+        and the ``deliver`` bundle is selected (``bundles=None`` means all bundles)."""
         _check_isolation(config.sandbox)   # before touching the filesystem
         root = _resolve_root(config)
         root.mkdir(parents=True, exist_ok=True)
@@ -51,7 +56,8 @@ class Session:
                       on_publish=on_publish)
         if hasattr(sandbox, "lock"):
             session.io_lock = sandbox.lock        # one lock for sandbox runs + parent file work
-        if on_publish is not None and hasattr(sandbox, "publisher"):
+        deliver = bundles is None or _DELIVER in _bundles.selected_bundles(bundles)
+        if on_publish is not None and deliver and hasattr(sandbox, "publisher"):
             sandbox.publisher = session.publish   # enables publish() inside run_python
         return session
 
@@ -158,49 +164,69 @@ class Session:
     def _add_input(self, source: Path | bytes, *, input_id: str, name: str,
                    content_type: str | None, description: str | None) -> Handle:
         validate_segment(input_id, what="input id")
-        existing = self.store.inputs().get(input_id)
-        if existing is not None:
-            return existing
         filename = safe_filename(name, fallback="upload.bin")
         size = _input_size(source)
         if size > self.config.max_input_bytes:
             raise ValueError(f"input too large ({size} bytes > {self.config.max_input_bytes})")
 
-        target_dir = self._input_dir(input_id)
-        fd, tmp = tempfile.mkstemp(dir=target_dir, prefix=".upload_")
-        try:
-            with os.fdopen(fd, "wb") as out:
-                if isinstance(source, (bytes, bytearray)):
-                    out.write(source)
-                else:
-                    with open(source, "rb") as src:
-                        shutil.copyfileobj(src, out)
-            os.chmod(tmp, 0o444)
+        # The manifest is child-writable in the container tier, so a recorded input is reused
+        # only if its file is really there AND holds the host's bytes; otherwise the host's
+        # bytes win. Either way the record is re-derived from the file below.
+        existing = self.store.inputs().get(input_id)
+        if (existing is not None and self._input_intact(existing, input_id)
+                and _same_content(self.root / existing.path, source)):
+            target = self.root / existing.path       # idempotent: no copy
+            filename = target.name
+        else:
+            target_dir = self._input_dir(input_id)
             target = target_dir / filename
-            os.replace(tmp, target)   # replaces (never writes through) a planted symlink
-        except BaseException:
-            Path(tmp).unlink(missing_ok=True)
-            raise
+            _clear_squatter(target)
+            fd, tmp = tempfile.mkstemp(dir=target_dir, prefix=".upload_")
+            try:
+                with os.fdopen(fd, "wb") as out:
+                    _copy_bounded(source, out, self.config.max_input_bytes)
+                os.chmod(tmp, 0o444)
+                os.replace(tmp, target)   # replaces (never writes through) a planted symlink
+            except BaseException:
+                Path(tmp).unlink(missing_ok=True)
+                raise
 
         ctype = content_type or mimetypes.guess_type(filename)[0]
         return self.store.put_input(
             path=f"{_INPUTS}/{input_id}/{filename}", size=size,
             preview=_input_preview(target, filename, size, ctype),
             source=f"upload:{filename}", input_id=input_id, content_type=ctype,
-            description=description)
+            description=description, replace=existing is not None)
+
+    def _input_intact(self, handle: Handle, input_id: str) -> bool:
+        """Whether a recorded input still points at its own regular file under inputs/<id>/.
+
+        In the container tier the manifest is writable by sandboxed code, so the record is
+        checked against the filesystem instead of being trusted.
+        """
+        parts = PurePosixPath(handle.path).parts
+        if handle.kind != "binary" or len(parts) != 3 or parts[:2] != (_INPUTS, input_id):
+            return False
+        for rel in (_INPUTS, f"{_INPUTS}/{input_id}"):
+            if (self.root / rel).is_symlink():
+                return False
+        try:
+            return stat.S_ISREG(os.lstat(self.root / handle.path).st_mode)
+        except OSError:
+            return False
 
     def _input_dir(self, input_id: str) -> Path:
-        """Create and return ``<root>/inputs/<input_id>``, refusing any planted symlink."""
-        for rel in (_INPUTS, f"{_INPUTS}/{input_id}"):
-            expected = self.root / rel
-            try:
-                resolved = safe_path(self.root, rel)
-            except PathEscapesRootError as e:
-                raise ValueError(f"{rel}/ resolves outside the workspace") from e
-            if resolved != expected:
-                raise ValueError(f"{rel}/ is a link; refusing to write through it")
-            expected.mkdir(exist_ok=True)
-        return self.root / _INPUTS / input_id
+        """Create and return ``<root>/inputs/<input_id>`` as real, writable directories.
+
+        Sandboxed code may have left a symlink, file, or read-only directory at either level;
+        under the session lock it is removed (never followed) or repaired, so an upload can
+        never be blocked or redirected.
+        """
+        path = self.root
+        for part in (_INPUTS, input_id):
+            path = path / part
+            _ensure_real_dir(path)
+        return path
 
     async def create_agent(
         self,
@@ -310,6 +336,75 @@ def _input_preview(path: Path, filename: str, size: int, content_type: str | Non
         raw = f.read(_PREVIEW_READ_BYTES)
     lines = raw.decode("utf-8", errors="replace").splitlines()[:_PREVIEW_LINES]
     return (head + "\n" + "\n".join(lines))[:_PREVIEW_CHARS]
+
+
+def _ensure_real_dir(path: Path) -> None:
+    """Make ``path`` a real directory we can write: replace anything else, never follow it."""
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        path.mkdir()
+        return
+    if not stat.S_ISDIR(st.st_mode):
+        path.unlink()          # symlink, file, FIFO, ...: removed, not followed
+        path.mkdir()
+        return
+    os.chmod(path, 0o755)      # lstat just proved it is a real directory, not a link
+
+
+def _clear_squatter(target: Path) -> None:
+    """Remove a directory squatting on an input's filename (``os.replace`` cannot)."""
+    try:
+        st = os.lstat(target)
+    except FileNotFoundError:
+        return
+    if stat.S_ISDIR(st.st_mode):
+        _make_tree_writable(target)
+        shutil.rmtree(target)      # rmtree does not follow symlinks
+
+
+def _make_tree_writable(top: Path) -> None:
+    """Make every real directory under ``top`` listable and writable so rmtree can empty it.
+
+    Walks top-down without following links (``os.walk`` default), chmods each directory
+    before descending into it, and touches nothing that ``lstat`` doesn't show to be a real
+    directory.
+    """
+    os.chmod(top, 0o700)       # the caller's lstat proved it is a real directory
+    for dirpath, dirnames, _ in os.walk(top):
+        for d in dirnames:
+            child = os.path.join(dirpath, d)
+            if stat.S_ISDIR(os.lstat(child).st_mode):
+                os.chmod(child, 0o700)
+
+
+def _sha256_file(path: Path | str) -> bytes:
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        while chunk := f.read(_COPY_CHUNK):
+            digest.update(chunk)
+    return digest.digest()
+
+
+def _same_content(path: Path, source: Path | bytes) -> bool:
+    """Whether the file at ``path`` holds exactly the host's ``source`` bytes."""
+    want = (hashlib.sha256(source).digest() if isinstance(source, (bytes, bytearray))
+            else _sha256_file(source))
+    return _sha256_file(path) == want
+
+
+def _copy_bounded(source: Path | bytes, out, limit: int) -> None:
+    """Copy ``source`` into ``out``; raise if more than ``limit`` bytes arrive."""
+    if isinstance(source, (bytes, bytearray)):
+        out.write(source)      # length already checked against the limit
+        return
+    copied = 0
+    with open(source, "rb") as src:
+        while chunk := src.read(_COPY_CHUNK):
+            copied += len(chunk)
+            if copied > limit:
+                raise ValueError(f"input too large (more than {limit} bytes while copying)")
+            out.write(chunk)
 
 
 def _check_isolation(sandbox_config: SandboxConfig) -> None:

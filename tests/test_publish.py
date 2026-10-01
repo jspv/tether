@@ -120,3 +120,49 @@ def test_rejects_oversize(tmp_path):
 @pytest.mark.parametrize("bad", ["", "   ", None, 5])
 def test_rejects_bad_path_values(tmp_path, bad):
     _reject(tmp_path, bad)
+
+
+def test_escape_errors_do_not_reveal_host_existence(tmp_path):
+    root = tmp_path / "root"
+    root.mkdir()
+    (tmp_path / "exists.txt").write_text("x")
+    os.symlink(tmp_path, root / "outputs")          # planted parent-dir symlink
+    def message(p):
+        with pytest.raises(PublishError) as ei:
+            validate_publication(root, p, name=None, description=None, source="s",
+                                 max_bytes=MAX)
+        return str(ei.value).replace(repr(p), "<p>")
+
+    # Each pair differs only in whether the host path exists; the answer must not.
+    assert message(str(tmp_path / "exists.txt")) == message(str(tmp_path / "missing.txt"))
+    assert message("outputs/exists.txt") == message("outputs/missing.txt")
+
+
+def test_symlink_loop_is_a_publish_error(tmp_path):
+    os.symlink(tmp_path / "b", tmp_path / "a")
+    os.symlink(tmp_path / "a", tmp_path / "b")
+    _reject(tmp_path, "a")
+
+
+def test_link_through_host_dirs_answers_the_same_whether_or_not_they_exist(tmp_path):
+    root = tmp_path / "root"
+    (root / "outputs").mkdir(parents=True)
+    (root / "outputs" / "f.txt").write_text("x")
+    (tmp_path / "hostdir").mkdir()
+    os.symlink(f"{tmp_path}/hostdir/../root/outputs", root / "l1")   # host dir exists
+    os.symlink(f"{tmp_path}/missing/../root/outputs", root / "l2")   # host dir missing
+    results = []
+    for p in ("l1/f.txt", "l2/f.txt"):
+        try:
+            validate_publication(root, p, name=None, description=None, source="s",
+                                 max_bytes=MAX)
+            results.append("published")
+        except PublishError as e:
+            results.append(str(e).replace(repr(p), "<p>"))
+    assert results[0] == results[1]
+
+
+def test_symlink_loop_in_a_parent_component_is_a_publish_error(tmp_path):
+    os.symlink(tmp_path / "b", tmp_path / "a")
+    os.symlink(tmp_path / "a", tmp_path / "b")
+    _reject(tmp_path, "a/x")

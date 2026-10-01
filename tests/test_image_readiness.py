@@ -223,3 +223,64 @@ def test_build_cli_check_mode_exits_nonzero_on_problems(monkeypatch, capsys):
         _build_sandbox_main(["--check"])
     assert ei.value.code == 1
     assert "nope" in capsys.readouterr().out
+
+
+def test_layer_build_shares_one_deadline(tmp_path, monkeypatch):
+    import tether.container_runtime as cr
+
+    clock = [0.0]
+    monkeypatch.setattr(cr.time, "monotonic", lambda: clock[0])
+    seen = {}
+
+    def run(argv, **kw):
+        if argv[1:3] == ["image", "inspect"]:
+            return _Proc(1)
+        if argv[1] == "build":
+            seen["build"] = kw["timeout"]
+            clock[0] += 60.0                      # the build took 60 s of the budget
+            return _Proc(0)
+        if "pip" in argv:
+            seen["pip"] = kw["timeout"]
+        return _Proc(0)
+
+    ensure_layer("podman", SandboxConfig(pip_packages=("six",), build_timeout_s=100.0),
+                 base=tmp_path, run=run)
+    assert seen["build"] == 100.0 and seen["pip"] == pytest.approx(40.0)
+
+
+def test_exhausted_deadline_raises_before_pip(tmp_path, monkeypatch):
+    import tether.container_runtime as cr
+
+    clock = [0.0]
+    monkeypatch.setattr(cr.time, "monotonic", lambda: clock[0])
+    calls = []
+
+    def run(argv, **kw):
+        calls.append(argv)
+        if argv[1:3] == ["image", "inspect"]:
+            return _Proc(1)
+        if argv[1] == "build":
+            clock[0] += 150.0
+        return _Proc(0)
+
+    with pytest.raises(SandboxImageError, match="timed out"):
+        ensure_layer("podman", SandboxConfig(pip_packages=("six",), build_timeout_s=100.0),
+                     base=tmp_path, run=run)
+    assert not any("pip" in a for a in calls)
+
+
+def test_layer_timeout_removes_named_container(tmp_path):
+    calls = []
+
+    def run(argv, **kw):
+        calls.append(argv)
+        if "pip" in argv:
+            raise subprocess.TimeoutExpired(argv, kw["timeout"])
+        return _Proc(0)
+
+    with pytest.raises(SandboxImageError):
+        ensure_layer("podman", SandboxConfig(pip_packages=("six",)), base=tmp_path, run=run)
+    pip_argv = next(a for a in calls if "pip" in a)
+    name = pip_argv[pip_argv.index("--name") + 1]
+    assert name.startswith("tether-layer-")
+    assert ["podman", "rm", "-f", name] in calls

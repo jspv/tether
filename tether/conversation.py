@@ -47,7 +47,7 @@ class Conversation:
         ``agent_instructions`` (the host's domain system prompt) is appended after tether's
         operating manual by MAF: ``<core + bundle instructions>\\n\\n<agent_instructions>``.
         """
-        session = Session.create(config, on_publish=on_publish)
+        session = Session.create(config, on_publish=on_publish, bundles=bundles)
         await session.__aenter__()
         try:
             agent = await session.create_agent(client, agent_instructions=agent_instructions,
@@ -93,10 +93,12 @@ class Conversation:
     async def aadd_input(self, source: "Path | bytes", *, input_id: str, name: str,
                          content_type: str | None = None,
                          description: str | None = None) -> "Handle":
-        """Ingest a user upload, waiting for any running turn to finish first."""
+        """Ingest a user upload, waiting for any running turn to finish first. The copy runs
+        in a worker thread so a large upload does not stall the event loop."""
         async with self._lock:
-            return self.session.add_input(source, input_id=input_id, name=name,
-                                          content_type=content_type, description=description)
+            return await asyncio.to_thread(
+                self.session.add_input, source, input_id=input_id, name=name,
+                content_type=content_type, description=description)
 
     async def aclose(self) -> None:
         """Tear down the workspace (MCP + bus), then reap the root unless retained. Idempotent."""

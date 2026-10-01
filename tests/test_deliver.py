@@ -347,3 +347,45 @@ def test_publish_handle_xlsx_without_openpyxl_is_an_error(tmp_path, monkeypatch)
     monkeypatch.setattr(pd.DataFrame, "to_excel", no_openpyxl)
     out = _tool(sess, "publish_handle")(h.id, format="xlsx")
     assert "openpyxl" in out["error"] and host.calls == []
+
+
+def test_sandbox_publish_disabled_without_deliver_bundle(tmp_path):
+    host = _Host()
+    sess = Session.create(TetherConfig(root_dir=tmp_path / "r"), on_publish=host,
+                          bundles=("code",))
+    res = sess.sandbox.run_code(_PUBLISH_CODE)
+    assert "publishing is not enabled" in res.stderr and host.calls == []
+
+
+def test_sandbox_publish_enabled_with_deliver_bundle(tmp_path):
+    host = _Host()
+    sess = Session.create(TetherConfig(root_dir=tmp_path / "r"), on_publish=host,
+                          bundles=("code", "deliver"))
+    assert sess.sandbox.run_code(_PUBLISH_CODE).published and len(host.calls) == 1
+
+
+def test_empty_bundle_selection_keeps_sandbox_publish(tmp_path):
+    host = _Host()
+    sess = Session.create(TetherConfig(root_dir=tmp_path / "r"), on_publish=host, bundles=())
+    sess.sandbox.run_code(_PUBLISH_CODE)
+    assert len(host.calls) == 1
+
+
+def test_conversation_without_deliver_disables_sandbox_publish(tmp_path):
+    from tether.conversation import Conversation
+
+    async def run():
+        conv = await Conversation.acreate(id="c", config=TetherConfig(root_dir=tmp_path / "r"),
+                                          client=StubChatClient([text("ok")]),
+                                          bundles=("code",), on_publish=_Host())
+        try:
+            return conv.session.sandbox.publisher
+        finally:
+            await conv.aclose()
+
+    assert asyncio.run(run()) is None
+
+
+def test_run_python_description_mentions_publish(tmp_path):
+    sess = _session(tmp_path, _Host())
+    assert "publish(" in _tool(sess, "run_python").__doc__

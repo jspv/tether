@@ -31,6 +31,8 @@ _SCRIPTS_DIR = ".scripts"
 # Bounds on the child -> parent publish channel; requests are untrusted input.
 _MAX_PUBLISH_CONTROL_BYTES = 1024 * 1024
 _MAX_PUBLISH_REQUESTS = 64
+# Handle fields only the parent may set: an input record must come from Session.add_input.
+_PARENT_ONLY_FIELDS = ("input_id", "content_type", "description")
 
 # publisher(path, *, name, description, source) -> result record (see Session.publish)
 Publisher = Callable[..., dict]
@@ -183,9 +185,11 @@ class _OrchestratedSandbox:
                 continue
             try:
                 rec = json.loads(line)
+                for key in _PARENT_ONLY_FIELDS:   # sandboxed code cannot mint an input
+                    rec.pop(key, None)
                 self.store.register(rec)
                 ids.append(rec["id"])
-            except (json.JSONDecodeError, ValueError, KeyError):
+            except (json.JSONDecodeError, ValueError, KeyError, AttributeError):
                 continue
         return ids
 

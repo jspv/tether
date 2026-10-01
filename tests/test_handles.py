@@ -169,3 +169,12 @@ def test_put_input_rejects_escaping_path(tmp_path):
 def test_non_input_summary_has_no_input_fields(tmp_path):
     s = HandleStore(tmp_path).put("hello", source="t").summary()
     assert not {"input_id", "content_type", "description"} & s.keys()
+
+
+def test_put_input_replace_keeps_id_and_persists(tmp_path):
+    store = HandleStore(tmp_path)
+    h = store.put_input(path="inputs/f1/a.csv", size=1, preview="p", source="s", input_id="f1")
+    h2 = store.put_input(path="inputs/f1/b.csv", size=2, preview="q", source="s2",
+                         input_id="f1", replace=True)
+    assert h2.id == h.id and h2.path == "inputs/f1/b.csv"
+    assert HandleStore(tmp_path).inputs()["f1"].path == "inputs/f1/b.csv"

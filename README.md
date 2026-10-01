@@ -272,7 +272,8 @@ copy it during the callback — it is deleted when the callback returns. Its ret
 value reaches the model under `"host"`; if it raises, the tool returns an error and the run
 continues. The callback runs synchronously in the tool call's context (so your contextvars are
 visible) but possibly on a worker thread — make it thread-safe. Sandbox `publish()` requests
-are processed after the script exits cleanly.
+are processed after the script exits cleanly. Both the tools and `publish()` require the
+`deliver` bundle **and** a callback; without either, they are not available to the model.
 
 ```python
 from tether import PublishedFile, Tether
@@ -436,7 +437,9 @@ Tether(cfg).solve("…")
 
 **Requiring isolation.** Set `require_isolation=True` to make the boundary mandatory: `backend="local"` is refused with `SandboxRuntimeUnavailable` at `Session.create` (not on first use), and a missing runtime or image raises — tether never falls back to the local tier.
 
-**Image readiness.** By default the image (Python + `preinstalled` libraries) and any `pip_packages` layer are **built on first use** and cached. `build_on_demand` controls this; its default (`None`) means "build unless `require_isolation`". With builds disabled, a missing image makes `run_python` fail immediately with `SandboxImageMissing`, naming the exact command to run. Builds that do run are bounded by `build_timeout_s` (`SandboxImageError` on expiry). Pre-build exactly what a host will ask for, and gate startup on a non-mutating preflight:
+**Image readiness.** By default the image (Python + `preinstalled` libraries) and any `pip_packages` layer are **built on first use** and cached. `build_on_demand` controls this; its default (`None`) means "build unless `require_isolation`". With builds disabled, a missing image makes `run_python` fail immediately with `SandboxImageMissing`, naming the exact command to run. Builds that do run are bounded by `build_timeout_s` (`SandboxImageError` on expiry); it is one
+budget for the image build and the pip layer together. A timed-out pip-layer container is
+removed, but a timed-out image build may finish in the runtime's background. Pre-build exactly what a host will ask for, and gate startup on a non-mutating preflight:
 
 ```bash
 tether-build-sandbox --preinstalled pandas pyarrow numpy httpx --pip rich   # build image + layer
