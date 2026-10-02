@@ -583,3 +583,139 @@ def test_rehydrated_input_drops_host_description_and_rederives_the_rest(tmp_path
     assert reloaded.description is None
     assert reloaded.content_type == "text/csv" and "col" in reloaded.preview
     assert reloaded.digest == h.digest
+
+
+# --- digest coverage: head, tail, and whole file when small --------------------------------
+
+_WIN = 64 * 1024
+
+
+def _flip(path, offset):
+    """Length-preserving single-byte edit at ``offset``."""
+    data = bytearray(path.read_bytes())
+    data[offset] ^= 0xFF
+    path.write_bytes(bytes(data))
+
+
+def _big_binary(store, size):
+    import os
+    return store.put(os.urandom(size), source="t", kind="binary", ext=".bin")
+
+
+def test_digest_detects_tail_edit_of_large_file(tmp_path):
+    from tether.handles import HandleTamperedError
+
+    store = HandleStore(tmp_path)
+    h = _big_binary(store, 3 * _WIN)
+    size = (tmp_path / h.path).stat().st_size
+    _flip(tmp_path / h.path, size - 1)
+    with pytest.raises(HandleTamperedError):
+        store.get(h.id)
+
+
+def test_digest_detects_head_edit_of_large_file(tmp_path):
+    from tether.handles import HandleTamperedError
+
+    store = HandleStore(tmp_path)
+    h = _big_binary(store, 3 * _WIN)
+    _flip(tmp_path / h.path, 0)
+    with pytest.raises(HandleTamperedError):
+        store.get(h.id)
+
+
+@pytest.mark.parametrize("size", [100, _WIN, _WIN + 1, _WIN + 5000, 2 * _WIN])
+def test_digest_fully_covers_files_up_to_two_windows(tmp_path, size):
+    """Up to 128 KiB the digest is the whole file: an edit at ANY offset is detected."""
+    from tether.handles import HandleTamperedError
+
+    for offset in (0, _WIN - 1, _WIN, size // 2, size - 1):
+        if offset >= size:
+            continue
+        store = HandleStore(tmp_path / f"s{size}_{offset}")
+        h = _big_binary(store, size)
+        _flip(store.root / h.path, offset)
+        with pytest.raises(HandleTamperedError):
+            store.get(h.id)
+
+
+def test_digest_middle_of_file_over_two_windows_is_the_documented_residual(tmp_path):
+    """Pin the stated limit: a length-preserving middle edit of a >128 KiB file is NOT caught."""
+    store = HandleStore(tmp_path)
+    h = _big_binary(store, 4 * _WIN)
+    _flip(tmp_path / h.path, 2 * _WIN)  # outside both windows
+    store.get(h.id)  # no raise -- this is what the README states
+
+
+@pytest.mark.parametrize("size", [0, 10, _WIN, _WIN + 1, 2 * _WIN, 2 * _WIN + 1, 5 * _WIN])
+def test_digest_is_deterministic_and_no_false_positive(tmp_path, size):
+    import os
+    from tether.handles import _digest_file
+
+    p = tmp_path / "f.bin"
+    p.write_bytes(os.urandom(size))
+    assert _digest_file(p) == _digest_file(p)
+    store = HandleStore(tmp_path / "r")
+    h = store.put(os.urandom(size), source="t", kind="binary", ext=".bin")
+    assert store.get(h.id).endswith(".bin")
+    assert store.get(h.id).endswith(".bin")
+
+
+def test_large_text_json_and_dataframe_round_trip_without_false_positive(tmp_path):
+    import os
+    store = HandleStore(tmp_path)
+    text = "line of text\n" * 40000
+    js = {"k": ["v" * 50] * 5000}
+    df = pd.DataFrame({"n": range(60000), "r": [os.urandom(4).hex() for _ in range(60000)]})
+    t = store.put(text, source="t")
+    j = store.put(js, source="t")
+    d = store.put(df, source="t")
+    assert (tmp_path / d.path).stat().st_size > 2 * _WIN
+    assert store.get(t.id) == text
+    assert store.get(j.id) == js
+    assert len(store.get(d.id)) == 60000
+
+
+def test_parquet_footer_rewrite_over_two_windows_is_detected(tmp_path):
+    """The motivating case: a parquet footer (schema + row count) lives at the tail."""
+    import os
+    import struct
+    from tether.handles import HandleTamperedError
+
+    store = HandleStore(tmp_path)
+    df = pd.DataFrame({"a": [os.urandom(16).hex() for _ in range(30000)]})
+    h = store.put(df, source="t")
+    path = tmp_path / h.path
+    data = path.read_bytes()
+    assert len(data) > 2 * _WIN
+    footer_len = struct.unpack("<I", data[-8:-4])[0]
+    footer_start = len(data) - 8 - footer_len
+    assert footer_start > _WIN, "footer must sit outside the head window"
+    _flip(path, footer_start + footer_len // 2)  # same length, inside the footer
+    with pytest.raises(HandleTamperedError):
+        store.get(h.id)
+
+
+def test_digest_none_still_tolerated_for_a_large_file(tmp_path):
+    from tether.handles import Handle
+
+    store = HandleStore(tmp_path)
+    p = tmp_path / "handles" / "big.bin"
+    p.write_bytes(b"\x01" * (3 * _WIN))
+    store._handles["nd"] = Handle(id="nd", kind="binary", path="handles/big.bin",
+                                  source="t", bytes=3 * _WIN, preview="")
+    assert store.get("nd").endswith("big.bin")
+
+
+def test_digest_from_before_the_format_change_is_not_accepted(tmp_path):
+    """An old-format (untagged) digest must fail verification, never silently pass."""
+    import hashlib
+    from tether.handles import HandleTamperedError
+
+    store = HandleStore(tmp_path)
+    h = store.put("hello", source="t")
+    p = tmp_path / h.path
+    old = hashlib.sha256(f"{p.stat().st_size}:".encode() + p.read_bytes()[:_WIN]).hexdigest()
+    assert h.digest != old and h.digest.startswith("v2:")
+    h.digest = old
+    with pytest.raises(HandleTamperedError):
+        store.get(h.id)

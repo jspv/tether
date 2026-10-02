@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import mimetypes
+import os
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -20,25 +21,48 @@ _PREVIEW_LINES = 5
 _PREVIEW_READ_BYTES = 4096
 
 
-def _digest_file(path: Path) -> str:
-    """Integrity digest for a handle's bytes: sha256 over the file's length plus its first
-    ``_DIGEST_BYTES`` bytes.
+_DIGEST_TAG = "v2:"
 
-    **Deliberately not a whole-file hash.** The describers read only a bounded window (a
-    preview, or one parquet row group) precisely so a multi-gigabyte handle can be described
-    cheaply; hashing the whole file would throw that away and make every ``get()`` re-read
-    the entire file just to validate it. A length-plus-prefix digest keeps the cost bounded
-    and is still a strong tamper signal: any rewrite that changes the file's length, and any
-    edit inside the first 64 KiB -- which is where every preview the model was shown comes
-    from -- is detected. An edit confined to the tail of a file larger than 64 KiB that
-    preserves its exact byte length is not detected. That is the trade-off, stated rather
-    than assumed.
+
+def _digest_file(path: Path) -> str:
+    """Integrity digest for a handle's bytes: ``"v2:"`` + sha256 over the file's length, its
+    first ``_DIGEST_BYTES`` (64 KiB) and its last ``_DIGEST_BYTES``.
+
+    **Coverage, exactly.** A file of 128 KiB or less is hashed *in its entirety*: an edit at
+    any offset is detected. A larger file is covered by its length, its first 64 KiB and its
+    last 64 KiB. A length-preserving edit to the **middle** of a file larger than 128 KiB
+    (the bytes between offset 64 KiB and ``size - 64 KiB``) is **not detected**. This is not
+    a whole-file integrity check.
+
+    The tail is covered because a parquet footer -- the schema and row count the summary
+    reports -- lives there, and the head alone left it unprotected.
+
+    **Why not a whole-file hash.** The describers read only a bounded window so a
+    multi-gigabyte handle can be described cheaply; hashing the whole file on every ``get()``
+    would throw that away. The residual above is the stated price.
+
+    **Boundary handling.** For ``size <= 2 * _DIGEST_BYTES`` the two windows would overlap
+    or touch, so the file is read once, whole, and hashed once (no byte is hashed twice). For
+    larger files the head and tail windows are disjoint, read with one seek on one open
+    handle. The size is taken from that open handle, so the length hashed is the length read.
+
+    **Format tag.** The ``v2:`` prefix distinguishes this from the earlier untagged
+    (length + first 64 KiB) digests. A digest recorded in the old format therefore never
+    equals a current one: it fails verification (a false failure) rather than passing
+    (a false pass). Handle digests are re-derived on rehydrate, so this only affects a
+    digest held across a code upgrade within one process.
     """
     h = hashlib.sha256()
-    h.update(f"{path.stat().st_size}:".encode())
     with path.open("rb") as f:
-        h.update(f.read(_DIGEST_BYTES))
-    return h.hexdigest()
+        size = os.fstat(f.fileno()).st_size
+        h.update(f"{size}:".encode())
+        if size <= 2 * _DIGEST_BYTES:
+            h.update(f.read())
+        else:
+            h.update(f.read(_DIGEST_BYTES))
+            f.seek(size - _DIGEST_BYTES)
+            h.update(f.read(_DIGEST_BYTES))
+    return _DIGEST_TAG + h.hexdigest()
 
 
 class HandleTamperedError(RuntimeError):
